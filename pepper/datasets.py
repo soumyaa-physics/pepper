@@ -25,6 +25,8 @@ def dataset_to_paths(dataset, store, ext=".root"):
         tag, counter = tag.rsplit("-", 1)
         pat = "{}/user/{}/{}/{}/*/*/*{}".format(
             store, username, primary, tag, ext)
+        print(pat)
+        exit()
     elif tier.startswith("NANOAOD"):
         campaign, version = processed.split("-", 1)
         datatype = "mc" if tier.endswith("SIM") else "data"
@@ -51,7 +53,7 @@ def read_paths(source, store, ext=".root"):
     """
     paths = []
     if source.endswith(ext):
-        paths = glob(source)
+        paths = glob("{}/{}".format(store,source))
     elif (source.count("/") == 3
             and (source.endswith("NANOAOD")
                  or source.endswith("NANOAODSIM")
