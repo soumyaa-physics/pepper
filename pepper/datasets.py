@@ -25,8 +25,6 @@ def dataset_to_paths(dataset, store, ext=".root"):
         tag, counter = tag.rsplit("-", 1)
         pat = "{}/user/{}/{}/{}/*/*/*{}".format(
             store, username, primary, tag, ext)
-        print(pat)
-        exit()
     elif tier.startswith("NANOAOD"):
         campaign, version = processed.split("-", 1)
         datatype = "mc" if tier.endswith("SIM") else "data"
