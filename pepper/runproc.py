@@ -80,6 +80,9 @@ def run_processor(processor_class=None, description=None, mconly=False):
         "process at once. A smaller value means less memory usage. Defaults "
         "to 5*10^5")
     parser.add_argument(
+        "--nfiles", type=int, help="Number of files per "
+        "each dataset that are used for analysis. Default: None")
+    parser.add_argument(
         "--force_chunksize", action="store_true", help="If present, makes the "
         "processor process exactly the number of events given in chunksize, "
         "unless there aren't enough events in the file. This will make "
@@ -195,6 +198,9 @@ def run_processor(processor_class=None, description=None, mconly=False):
     if args.debug:
         print("Processing only one chunk per dataset because of --debug")
         datasets = {key: [val[0]] for key, val in datasets.items()}
+    elif args.nfiles:
+        print("Processing only nfiles per dataset because of --nfiles")
+        datasets = {key: val[:int(args.nfiles)] for key, val in datasets.items()}
 
     if len(datasets) == 0:
         sys.exit("No datasets found")
