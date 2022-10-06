@@ -357,8 +357,8 @@ class Processor(coffea.processor.ProcessorABC):
             else:
                 hist_sum += hist
         cutnum = cuts.index(key[0])
-        fname = "Cut {:03} {}.coffea".format(cutnum, "_".join(key))
-        fname = fname.replace("/", "")
+        fname = "Cut-{:03}_{}.coffea".format(cutnum, "_".join(key))
+        fname = fname.replace("/", "").replace(" ", "_")
         coffea.util.save(hist_sum, os.path.join(dest, fname))
         return {key: fname}
 
@@ -384,16 +384,17 @@ class Processor(coffea.processor.ProcessorABC):
         cutnum = cuts.index(key[0])
         fnames = {}
         for new_key, hist in hists.items():
-            fname = "Cut {:03} {}.coffea".format(cutnum, "_".join(new_key))
-            fname = fname.replace("/", "")
+            fname = "Cut-{:03}_{}.coffea".format(cutnum, "_".join(new_key))
+            fname = fname.replace("/", "").replace(" ", "_")
             coffea.util.save(hist, os.path.join(dest, fname))
             fnames[new_key] = fname
         return fnames
 
     @staticmethod
-    def _save_root_hists(key, histdict, dest):
+    def _save_root_hists(key, histdict, dest, cuts):
         fnames = {}
         outputs = defaultdict(list)
+        cutnum = cuts.index(key[0])
         for dataset, hist in histdict.items():
             if "sys" in [ax.name for ax in hist.axes]:
                 sysnames = hist.axes["sys"]
@@ -409,6 +410,7 @@ class Processor(coffea.processor.ProcessorABC):
                 else:
                     fullkey = key + (sysname,)
                 fname = '_'.join(fullkey).replace('/', '_') + ".root"
+                fname = f"Cut-{cutnum:03}_{fname}".replace(" ", "_")
                 outputs[fname].append(histsys)
                 fnames[fullkey] = fname
         for fname, contents in outputs.items():
@@ -440,7 +442,7 @@ class Processor(coffea.processor.ProcessorABC):
             elif format == "root":
                 for key, histdict in hists.items():
                     futures.append(executor.submit(
-                        cls._save_root_hists, key, histdict, dest))
+                        cls._save_root_hists, key, histdict, dest, cuts))
 
             hist_names = {}
             for future in tqdm(concurrent.futures.as_completed(futures),
