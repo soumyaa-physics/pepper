@@ -304,7 +304,7 @@ def get_parsl_config(num_jobs, runtime=3*60*60, memory=None, retries=None,
         worker_init=condor_init
     )
     launch_cmd = ("python3 "
-                  "~/.local/bin/process_worker_pool.py "
+                  "$(which process_worker_pool.py) "
                   "{debug} "
                   "{max_workers} "
                   "-a {addresses} "

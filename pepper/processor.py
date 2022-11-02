@@ -28,6 +28,10 @@ class Processor(coffea.processor.ProcessorABC):
     classes"""
     config_class = pepper.Config
     schema_class = NanoAODSchema
+    schema_class.mixins.update({
+        "PFCandidate": "PtEtaPhiMCollection",
+        "SV": "PtEtaPhiMCollection",
+    })
 
     def __init__(self, config, eventdir):
         """Create a new Processor
