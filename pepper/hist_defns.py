@@ -31,6 +31,11 @@ def concatenate(*arr, axis=0):
     return ak.concatenate(arr_processed, axis=axis)
 
 
+def max_abs(data):
+    max_ = ak.argmax(np.abs(data), axis=1, keepdims=True, mask_identity=True)
+    max_ = max_[~ak.is_none(max_,axis=1)]
+    return data[max_]
+
 func_dict = {
     "sin": np.sin,
     "cos": np.cos,
@@ -59,6 +64,7 @@ func_dict = {
     "zeros_like": ak.zeros_like,
     "ones_like": ak.ones_like,
     "full_like": ak.full_like,
+    "max_abs": max_abs,
 }
 
 

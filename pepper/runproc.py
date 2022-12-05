@@ -125,6 +125,9 @@ def run_processor(processor_class=None, description=None, mconly=False):
         "should not be loaded, as this can lead to bogus results. Default is "
         "'pepper_state.coffea'", default="pepper_state.coffea"
     )
+    parser.add_argument(
+        "--memory", help="Memmory requested by the htcondor_job", default=None
+    )
     args = parser.parse_args()
 
     logger = logging.getLogger("pepper")
@@ -268,7 +271,9 @@ def run_processor(processor_class=None, description=None, mconly=False):
             retries=args.retries,
             condor_submit=condorsubmit,
             condor_init=condorinit,
-            workers_per_job=args.condorworkers)
+            workers_per_job=args.condorworkers,
+            memory=args.memory
+            )
         parsl.load(parsl_config)
     else:
         if args.condorinit is not None or args.condorsubmit is not None:
