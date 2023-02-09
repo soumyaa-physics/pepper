@@ -724,8 +724,18 @@ class ProcessorBasicPhysics(pepper.Processor):
             JetPt=raw_pt, JetEta=eta, JetA=area, Rho=rho)
         return raw_factor * l1l2l3
 
+    def get_junc_factor_mask(self, data, source, pt, eta, flavor):
+        """
+        Some Jet enery uncertainties are for specific jet flavors only. This
+        method decides which jets to apply the uncertainties to.
+
+        Returns None to indicate to apply the uncertainty to all jets.
+        Otherwise a bool ak.Array with either True or False for every jet
+        """
+        return None  # To be modified in subclasses
+
     def compute_junc_factor(self, data, variation, source="jes", pt=None,
-                            eta=None):
+                            eta=None, flavor=None):
         """Return jet energy correction uncertainty factor."""
         if variation not in ("up", "down"):
             raise ValueError("variation must be either 'up' or 'down'")
@@ -735,16 +745,18 @@ class ProcessorBasicPhysics(pepper.Processor):
             pt = data["Jet"].pt
         if eta is None:
             eta = data["Jet"].eta
+        if flavor is None:
+            flavor = data["Jet"].partonFlavour
         counts = ak.num(pt)
         if ak.sum(counts) == 0:
             return ak.unflatten([], counts)
-        # TODO: test this
         junc = dict(self.config["jet_uncertainty"].getUncertainty(
             JetPt=pt, JetEta=eta))[source]
-        if variation == "up":
-            return junc[:, :, 0]
-        else:
-            return junc[:, :, 1]
+        junc = junc[:, :, 0 if variation == "up" else 1]
+        mask = self.get_junc_factor_mask(data, source, pt, eta, flavor)
+        if mask is not None:
+            junc = ak.where(mask, junc, ak.ones_like(junc))
+        return junc
 
     def compute_jer_factor(self, data, rng, variation="central", pt=None,
                            eta=None, hybrid=True):
@@ -899,7 +911,8 @@ class ProcessorBasicPhysics(pepper.Processor):
         # difference is negligible.
         if junc is not None:
             jets["juncfac"] = self.compute_junc_factor(
-                data, *junc, pt=jets["pt"], eta=jets["eta"])
+                data, *junc, pt=jets["pt"], eta=jets["eta"],
+                flavor=np.zeros_like(jets["pt"]))
         else:
             jets["juncfac"] = ak.ones_like(jets["pt"])
         if jer is not None:
@@ -1056,16 +1069,32 @@ class ProcessorBasicPhysics(pepper.Processor):
         for i, weighter in enumerate(self.config["btag_sf"]):
             central = weighter(wp, flav, eta, pt, discr, "central", efficiency)
             if not never_sys and self.config["compute_systematics"]:
-                if ("split_btag_year_corr" in self.config and
+                if "btag_splitting_scheme" in self.config:
+                    scheme = self.config["btag_splitting_scheme"].lower()
+                elif ("split_btag_year_corr" in self.config and
                         self.config["split_btag_year_corr"]):
-                    unc_splits = {"corr": "_correlated",
-                                  "uncorr": "_uncorrelated"}
+                    scheme = "years"
                 else:
-                    unc_splits = {"": ""}
-                for name, split in unc_splits.items():
+                    scheme = None
+                if scheme is None:
+                    light_unc_splits = heavy_unc_splits = {"": ""}
+                elif scheme == "years":
+                    light_unc_splits = heavy_unc_splits = \
+                        {"corr": "_correlated", "uncorr": "_uncorrelated"}
+                elif scheme == "sources":
+                    heavy_unc_splits = {name: f"_{name}"
+                                        for name in weighter.sources}
+                    light_unc_splits = {"corr": "_correlated",
+                                        "uncorr": "_uncorrelated"}
+                else:
+                    raise ValueError(
+                        f"Invalid btag uncertainty scheme {scheme}")
+
+                for name, split in heavy_unc_splits.items():
                     systematics[f"btagsf{i}" + name] = self.compute_btag_sys(
                         central, "heavy up" + split, "heavy down" + split,
                         weighter, wp, flav, eta, pt, discr, efficiency)
+                for name, split in light_unc_splits.items():
                     systematics[f"btagsf{i}light" + name] = \
                         self.compute_btag_sys(
                             central, "light up" + split, "light down" + split,
@@ -1100,9 +1129,11 @@ class ProcessorBasicPhysics(pepper.Processor):
         elif dsname in self.config["dataset_for_systematics"]:
             name = self.config["dataset_for_systematics"][dsname][1]
             if name in available:
+                sys = systematics[name]
                 varied_sf = self.compute_weight_btag(data, name, True)
                 selector.set_systematic("weight", sys / central * varied_sf)
         elif variation.name in available:
+            sys = systematics[name]
             varied_sf = self.compute_weight_btag(data, variation.name, True)
             selector.set_systematic("weight", sys / central * varied_sf)
 
