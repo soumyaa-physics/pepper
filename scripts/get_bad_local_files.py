@@ -3,17 +3,19 @@
 import os
 import signal
 import pepper
-import uproot
+#import uproot
 import json
 import gzip
 import concurrent.futures
 from argparse import ArgumentParser
 from tqdm import tqdm
-
+import ROOT
 
 def check(path):
-    with uproot.open(path):
-        pass
+    f = ROOT.TFile.Open(path)
+    if f.IsZombie():
+        raise Exception("Zombie")
+    f.Close()
 
 
 def wait_and_check(path, timeout):
@@ -21,10 +23,14 @@ def wait_and_check(path, timeout):
         pid = executor.submit(os.getpid).result()
         future = executor.submit(check, path)
         try:
-            future.result(timeout)
-        except concurrent.futures.TimeoutError:
+            # future.result(timeout)
+            future.result()
+        except Exception as exc:
             os.kill(pid, signal.SIGKILL)
             raise
+        # except concurrent.futures.TimeoutError:
+        #     os.kill(pid, signal.SIGKILL)
+        #     raise
 
 
 parser = ArgumentParser(
@@ -80,10 +86,14 @@ if not args.no_search:
             for future in concurrent.futures.as_completed(futures):
                 try:
                     future.result()
-                except (OSError, concurrent.futures.TimeoutError,
-                        concurrent.futures.process.BrokenProcessPool):
+                except Exception as exc:
                     corrupt.append(futures[future])
+                    #print(f"Error: {exc}")
                     print(f"Failure in {futures[future]}")
+                # except (OSError, concurrent.futures.TimeoutError,
+                #         concurrent.futures.process.BrokenProcessPool):
+                #     corrupt.append(futures[future])
+                #     print(f"Failure in {futures[future]}")
                 pbar.update(1)
 
 with open(args.out, "w") as f:
