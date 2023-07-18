@@ -51,6 +51,7 @@ class ConfigBasicPhysics(pepper.Config):
                 "jet_ressf": partial(
                     self._get_jet_general, evaltype="jersf",
                     cls=coffea.jetmet_tools.JetResolutionScaleFactor),
+                "jet_fake_rate": self._get_jet_fake_rate,
                 "MET_xy_shifts": self._get_maybe_external,
                 "mc_lumifactors": self._get_maybe_external,
                 "crosssection_uncertainty": self._get_maybe_external,
@@ -89,6 +90,15 @@ class ConfigBasicPhysics(pepper.Config):
             syst = self._get_scalefactor(sfpath_syst)
             sfs.append(MuonScaleFactor(nominal, stat, syst))
         return sfs
+
+    def _get_jet_fake_rate(self, value):
+        if not isinstance(value, list) or len(value) < 2:
+            raise pepper.config.ConfigError(
+                "scale factors needs to be list of 2-element-lists in "
+                "form of [rootfile, histname]")
+        with uproot.open(self._get_path(value[0])) as f:
+            hist = f[value[1]]
+        return ScaleFactors.from_hist(hist, value[2])
 
     @staticmethod
     def _get_year(value):

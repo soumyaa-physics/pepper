@@ -8,6 +8,7 @@ import mt2
 import numba as nb
 
 from coffea.nanoevents import NanoAODSchema
+import coffea
 
 class ProcessorSTau(pepper.ProcessorBasicPhysics):
 
@@ -152,9 +153,9 @@ class ProcessorSTau(pepper.ProcessorBasicPhysics):
             tau_vis = data.GenVisTau[ ((data.GenVisTau.pt > 30) & (abs(data.GenVisTau.eta) < 2.4) &
                                       (data.GenVisTau.parent.hasFlags(["fromHardProcess"])))
                                     ] 
-            matches_h, dRlist = data["jet_1"].nearest(data.GenVisTau, return_metric=True, threshold=0.4)
+            matches_h, dRlist = data["jet_1"].nearest(tau_vis, return_metric=True, threshold=0.4)
             has_hps1 = ak.firsts(~ak.is_none(matches_h, axis=1))
-            matches_h, dRlist = data["jet_2"].nearest(data.GenVisTau, return_metric=True, threshold=0.4)
+            matches_h, dRlist = data["jet_2"].nearest(tau_vis, return_metric=True, threshold=0.4)
             has_hps2 = ak.firsts(~ak.is_none(matches_h, axis=1))
             mask["G1G2"] = ( has_hps1 & has_hps2 )
             mask["G1F2"] = ( has_hps1 & (~has_hps2) )
@@ -494,7 +495,7 @@ class ProcessorSTau(pepper.ProcessorBasicPhysics):
         return data["MET"].pt > self.config["MET_pt"] #GeV
 
     @zero_handler
-    def match_nearest(self, data, coll1=None, coll2=None, dR = 0.4, not_matched = False):
+    def match_nearest(self, data, coll1 = None, coll2 = None, dR = 0.4, not_matched = False):
         obj1 = data[coll1]
         obj2 = data[coll2]
         matches, dRlist = obj1.nearest(obj2, return_metric=True, threshold=dR)
@@ -506,7 +507,21 @@ class ProcessorSTau(pepper.ProcessorBasicPhysics):
         results = obj1[idx_matches_jets] # this function drops all False e.g: [[obj, obj,..],..]
         sort_idx = ak.argsort(results.pt, axis=-1, ascending=False)
         return results[sort_idx]
-                      
+    
+    @zero_handler
+    def match_jet_to_pfcand(self, data, jet_name = None, pf_name = None, dR = 0.4):
+        '''
+        This function match all particle-flow candidates to every jet in the [jet_name] collection
+        (function is alternative to match_nearest, but works for multydim case and expected to be much slower)
+        '''
+        jets = data[jet_name]
+        pfcands = data[pf_name]
+        # here return_combinations=True is needed to return _pfcands_unzipped
+        # which broadcasted in the way to duplicate pdcands list per every jet in event
+        (dr, (_, _pfcands_unzipped)) = jets.metric_table(pfcands, metric=coffea.nanoevents.methods.vector.LorentzVector.delta_r, return_combinations=True)
+        pfcands_matched = _pfcands_unzipped[(dr < dR)]
+        return pfcands_matched
+                  
     @zero_handler    
     def get_mt2(self, data, name_1, name_2, name_MET = "MET") :
         # invisible_parts = data.GenPart[ (abs(data.GenPart.pdgId) == 1000022) & 
@@ -531,17 +546,22 @@ class ProcessorSTau(pepper.ProcessorBasicPhysics):
             & (pfCands.eta > self.config["pfcand_eta_min"])
             & (pfCands[self.config["track"]])
         )
-        return pfCands[is_good]
+        pfCands_selected = pfCands[is_good]
+        sort_idx = ak.argsort(pfCands_selected.pt, axis=-1, ascending=False)
+        return pfCands_selected[sort_idx]
 
     @zero_handler
     def get_matched_pfCands(self, data, match_object, dR=0.4):
-        pfCands = self.match_nearest(data, coll1="pfcand_valid", coll2=match_object, dR=dR)
-        # print(pfCands)
-        pfCands = ak.firsts(pfCands, axis=-1) # take only leading pfCand (optional) - pfCands are sorted over pt
-        # print(pfCands)
-        pfCands["dxySig"] = pfCands.dxy / pfCands.dxyError
-        pfCands["Lrel"] = np.sqrt(pfCands.dxy**2 + pfCands.dz**2)
-        return pfCands
+        # pfCands = self.match_nearest(data, coll1="pfcand_valid", coll2=match_object, dR=dR)
+        pfCands = self.match_jet_to_pfcand(data, jet_name=match_object, pf_name="pfcand_valid", dR=dR)
+        pfCands_lead = ak.firsts(pfCands, axis=-1) # take only leading pfCand (optional) - pfCands are sorted over pt
+        # properties for the leading pfcand (dxy, dxySig, ...)
+        pfCands_lead["dxysig"] = pfCands_lead.dxy / pfCands_lead.dxyError
+        pfCands_lead["Lrel"] = np.sqrt(pfCands_lead.dxy**2 + pfCands_lead.dz**2)
+        # weighted properties
+        pfCands_lead["dxy_weight"] = ak.mean(pfCands.dxy, weight=pfCands.pt, axis=-1)
+        pfCands_lead["dxysig_weight"] = ak.mean(pfCands.dxy / pfCands.dxyError, weight=pfCands.pt, axis=-1)
+        return pfCands_lead
     
     @zero_handler
     def gen_stau(self, data):
@@ -619,8 +639,8 @@ class ProcessorSTau(pepper.ProcessorBasicPhysics):
                               ak.firsts(data["jet_2"].phi))
         
     @zero_handler
-    def n_dis_tagged(self, data, threshold=None):
-        jets = data["jets_valid"]
+    def n_dis_tagged(self, data, jet_name="jets_valid", threshold=None):
+        jets = data[jet_name]
         jets = jets[ (jets.disTauTag_score1 > threshold) ]
         return ak.num(jets)
     
