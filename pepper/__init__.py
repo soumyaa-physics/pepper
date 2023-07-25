@@ -15,6 +15,7 @@ from pepper.processor_basic import ProcessorBasicPhysics
 from pepper.processor_ttbarll import Processor as ProcessorTTbarLL
 from pepper import scale_factors
 from pepper.processor_stau_basic import ProcessorSTau as ProcessorSTau
+from pepper.config_stau import ConfigSTau as ConfigSTau
 
 __all__ = [
     "HistDefinition",
@@ -33,5 +34,6 @@ __all__ = [
     "ProcessorBasicPhysics",
     "ProcessorTTbarLL",
     "scale_factors",
-    "ProcessorSTau"
+    "ProcessorSTau",
+    "ConfigSTau"
 ]

@@ -67,7 +67,7 @@ class ScaleFactors:
             factors[tuple([slice(None)] * i + [slice(-1, None)])] = value
 
     @classmethod
-    def from_hist(cls, hist, dimlabels=None, setoverflow=False):
+    def from_hist(cls, hist, dimlabels=None, setoverflow=True):
         edges = hist.to_numpy(flow=True)[1:]
         if dimlabels is None:
             dimlabels = []
