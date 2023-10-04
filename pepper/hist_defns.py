@@ -36,6 +36,12 @@ def max_abs(data):
     max_ = max_[~ak.is_none(max_,axis=1)]
     return data[max_]
 
+def num(data):
+    if len(data) == 0:
+        return ak.Array([])
+    else:
+        return ak.num(data)
+
 func_dict = {
     "sin": np.sin,
     "cos": np.cos,
@@ -60,7 +66,7 @@ func_dict = {
     "concatenate": concatenate,
 
     "sum": lambda x: ak.sum(x, axis=1),
-    "num": ak.num,
+    "num": num,
     "zeros_like": ak.zeros_like,
     "ones_like": ak.ones_like,
     "full_like": ak.full_like,

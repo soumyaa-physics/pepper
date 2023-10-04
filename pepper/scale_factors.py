@@ -67,7 +67,7 @@ class ScaleFactors:
             factors[tuple([slice(None)] * i + [slice(-1, None)])] = value
 
     @classmethod
-    def from_hist(cls, hist, dimlabels=None):
+    def from_hist(cls, hist, dimlabels=None, setoverflow=True):
         edges = hist.to_numpy(flow=True)[1:]
         if dimlabels is None:
             dimlabels = []
@@ -82,11 +82,12 @@ class ScaleFactors:
                 f"Got {len(edges)} dimensions but {len(dimlabels)} labels")
         # Set overflow bins to 1 so that events outside the histogram
         # get scaled by 1
-        cls._setoverflow(factors, 1)
-        if factors_up is not None:
-            cls._setoverflow(factors_up, 1)
-        if factors_down is not None:
-            cls._setoverflow(factors_down, 1)
+        if setoverflow:
+            cls._setoverflow(factors, 1)
+            if factors_up is not None:
+                cls._setoverflow(factors_up, 1)
+            if factors_down is not None:
+                cls._setoverflow(factors_down, 1)
         bins = dict(zip(dimlabels, edges))
         return cls(factors, factors_up, factors_down, bins)
 

@@ -128,6 +128,9 @@ def run_processor(processor_class=None, description=None, mconly=False):
     parser.add_argument(
         "--memory", help="Memmory requested by the htcondor_job", default=None
     )
+    parser.add_argument(
+        "--logconf", help="Storing config state in the output folder", default=True
+    )
     args = parser.parse_args()
 
     logger = logging.getLogger("pepper")
@@ -241,6 +244,9 @@ def run_processor(processor_class=None, description=None, mconly=False):
 
     # Create histdir and in case of errors, raise them now (before processing)
     os.makedirs(args.output, exist_ok=True)
+    
+    if args.logconf:
+        shutil.copyfile(args.config, f"{args.output}/config.json")
 
     if os.path.realpath(args.metadata) == os.path.realpath(args.statedata):
         print("--metadata and --statedate can not be the same")
