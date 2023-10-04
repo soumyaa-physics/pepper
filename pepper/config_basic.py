@@ -14,6 +14,7 @@ from pepper.scale_factors import (
     get_evaluator,
     ScaleFactors,
     MuonScaleFactor,
+    JetPuIdWeighter
 )
 
 
@@ -21,13 +22,15 @@ class ConfigBasicPhysics(pepper.Config):
     def __init__(self, path_or_file, textparser=hjson.load, cwd="."):
         """Initialize the configuration.
 
-        Arguments:
-        path_or_file -- Either a path to the file containing the configuration
-                        or a file-like object of it
-        textparser -- Callable to be used to parse the text contained in
-                      path_or_file
-        cwd -- A path to use as the working directory for relative paths in the
-               config. The actual working directory of the process might change
+        Parameters
+        ----------
+        path
+            Path to the file containing the configuration
+        textparser
+            Callable to be used to parse the text contained in path_or_file
+        cwd
+            Path to use as the working directory for relative paths in the
+            config. The actual working directory of the process might change
         """
         super().__init__(path_or_file, textparser, cwd)
         self.behaviors.update(
@@ -40,6 +43,7 @@ class ConfigBasicPhysics(pepper.Config):
                 "muon_sf": self._get_muonscalefactor,
                 "muon_rochester": self._get_rochester_corr,
                 "btag_sf": self._get_btag_sf,
+                "jet_puid_sf": self._get_puid_sf,
                 "jet_correction_mc": self._get_jet_correction,
                 "jet_correction_data": self._get_jet_correction,
                 "jet_uncertainty": partial(
@@ -92,18 +96,7 @@ class ConfigBasicPhysics(pepper.Config):
 
     @staticmethod
     def _get_year(value):
-        year = str(value)
-        if year not in (
-            "2016",
-            "2017",
-            "2018",
-            "ul2016pre",
-            "ul2016post",
-            "ul2017",
-            "ul2018",
-        ):
-            raise pepper.config.ConfigError("Invalid year {}".format(year))
-        return year
+        return str(value)
 
     @staticmethod
     def _get_top_pt_reweighting(value):
@@ -132,6 +125,13 @@ class ConfigBasicPhysics(pepper.Config):
                 method=method, ignore_missing=ignore_missing)
             weighters.append(btagweighter)
         return weighters
+
+    def _get_puid_sf(self, value):
+        if not isinstance(value, list) or len(value) > 2:
+            raise pepper.config.ConfigError(
+                "jet_puid_sf should be a list of either the SFs, or "
+                "SFs, efficiency")
+        return JetPuIdWeighter(*[self._get_path(path) for path in value])
 
     def _get_btag_corr(self, value):
         # Dump content of hjson file to dict

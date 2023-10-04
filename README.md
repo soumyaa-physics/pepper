@@ -13,8 +13,12 @@ git clone <repository url> pepper
 cd pepper
 source example/environment.sh
 python3 -m pip install --upgrade --upgrade-strategy eager --editable .
+# Additionally only if on CentOS7 (e.g. DESY NAF in 2023):
+python3 -m pip install "urllib3<2"
 ```
 This will update all dependencies to the latest version. Now `pepper` can be imported as any other python package from any location. Because of the `--editable` option, if you edit files inside your cloned pepper directory, the changes will be in effect already the next time you `import pepper`.
+
+__Note__: If you are on CentOS7, please run `python3 -m pip install "urllib3<2"`, as written above. CentOS7 is lacking a recent OpenSSL version, thus an older urllib3 version is required.
 
 
 
@@ -29,6 +33,8 @@ In order to run on HTCondor using `pepper.runproc`, one only has to specify the 
 To control which environment is employed on the HTCondor node, the parameter `--condorinit` can be used. `--condorinit` should point to a Shell script that can be sourced setting up the environment. If `--condorinit` is not present, Pepper will instead use the script that is pointed at by the local environment variable `PEPPER_CONDOR_ENV`. If this is also not set, the jobs will be run in the default environment of your HTCondor system. For an example environment script setting up LCG on CentOS7 see [here](example/environment.sh).
 
 When running on HTCondor, the local process, that has started also the jobs, needs to be kept open until everything has finished. In order to not accidentally kill the process by an unstable connection or similar, it is recommended to run it inside a `byobu`, `tmux` or `screen` session, or to prepend the command `nohup`.
+
+A directory with logs from the jobs will be present under `pepper_logs`. Directories inside `pepper_logs` are numbered, the highest number is the one of the latest run. The log level of the logs inside is controller via the `--loglevel` option. Set it to `debug` to get full logging.
 
 ### XRootD usage
 Pepper is able to access data sets from remote servers using XRootD. You should specify `"file_mode": "local+xrootd"` and `"xrootddomain": "xrootd-cms.infn.it"` in your config to enable it. There are four requirements to get it working (also in conjunction with HTCondor):
@@ -48,10 +54,13 @@ The scripts directory of this repository contains several helper scripts to obta
  - `delete_duplicate_outputs.py`: Check for duplication in the per event data produced by select_events.py, and move or delete any duplicates
  - `export_hists_from_state.py`: Save all histograms contained in a Pepper processor state, even if processing of all data hasn't been finished yet
  - `generate_btag_efficiencies.py`: Generate a ROOT file containing efficiency histograms needed for b-tagging scale factors
+ - `generate_jet_puid_efficiencies`: Generate a ROOT file containing efficiency histograms needed for computing jet pile-up ID scale factors
+ - `get_bad_local_files.py`: Find NanoAOD files that exist in the store directory but are not accessible, possibly due to technical issues
+ - `hdf5_to_ttree.py`: Merge and convert Pepper HDF5 files to Root files containing TTrees
  - `merge_hists.py`: Caluclate weighted average of two SF histograms
- - `plot_control.py`: Create control plots from Coffea histograms
- - `plotter.py`: Create control plots from Coffea histograms
+ - `plot_histograms.py`: Plot histograms in a ratioplot style
  - `produce_met_xy_nums.py`: Convert MET-xy correction numbers from the C++ headers provided centrally to json files
+ - `rucio_create_rules.py`: Creates Rucio rules for all data sets specified in a Pepper config. Once the rules are approved, the data sets will be transfered to the local site.
  - `ttbarll_dy_sf_calculate.py`: Calculate scale factors for DY reweighting from the output of ttbarll_dy_sf_produce.py
  - `ttbarll_dy_sf_produce.py`: Produce the numbers needed for DY SF calculation
  - `ttbarll_kinreco_hists_produce.py`: Generate histograms needed for top-quark kinematic reconstruction

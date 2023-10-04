@@ -2,17 +2,14 @@
 
 import os
 import sys
-from functools import partial
 import importlib
-import coffea
-import shutil
-import parsl
 import argparse
 import logging
 from datetime import datetime
 
 import pepper
 import pepper.executor
+import pepper.htcondor
 
 
 BUILTIN_PROCESSORS = {
@@ -115,6 +112,9 @@ def run_processor(processor_class=None, description=None, mconly=False):
         "increases memory usage inside the job. Default is 1."
     )
     parser.add_argument(
+        "--condorlogdir", help="Directory to store stdout and stderr logs "
+        "running on HTCondor. Default is pepper_logs", default="pepper_logs")
+    parser.add_argument(
         "--metadata", help="File to cache metadata in. This allows speeding "
         "up or skipping the preprocessing step. Default is "
         "'pepper_metadata.coffea'", default="pepper_metadata.coffea")
@@ -130,6 +130,11 @@ def run_processor(processor_class=None, description=None, mconly=False):
     )
     parser.add_argument(
         "--logconf", help="Storing config state in the output folder", default=True
+    )
+    parser.add_argument(
+        "-R", "--resume", action="store_true", help="If present and the file "
+        "pointed to by --statedata exists, load the file and resume from that "
+        "state"
     )
     args = parser.parse_args()
 
@@ -169,7 +174,11 @@ def run_processor(processor_class=None, description=None, mconly=False):
         Processor = processor_class
 
     config = Processor.config_class(args.config)
-    store = config["store"] if "store" in config else None
+    store = None
+    if ("store" in config
+        and ("file_mode" not in config
+             or "local" in config["file_mode"])):
+        store = config["store"]
     if store is not None and not os.path.exists(store):
         raise pepper.config.ConfigError("store directory does not exist")
 
@@ -181,6 +190,8 @@ def run_processor(processor_class=None, description=None, mconly=False):
             "X509_USER_PROXY does not point to a proxy certificate. "
             "Please set X509_USER_PROXY and run voms-proxy-init --voms "
             "cms --out $X509_USER_PROXY")
+
+    processor = Processor(config, args.eventdir)
 
     datasets = {}
     if args.file is None:
@@ -220,28 +231,6 @@ def run_processor(processor_class=None, description=None, mconly=False):
     if len(datasets) == 0:
         sys.exit("No datasets found")
 
-    if args.eventdir is not None:
-        # Check for non-empty subdirectories and remove them if wanted
-        nonempty = []
-        for dsname in datasets.keys():
-            try:
-                next(os.scandir(os.path.join(args.eventdir, dsname)))
-            except (FileNotFoundError, StopIteration):
-                pass
-            else:
-                nonempty.append(dsname)
-        if len(nonempty) != 0:
-            print(
-                "Non-empty output directories: {}".format(", ".join(nonempty)))
-            while True:
-                answer = input("Delete? y/n ")
-                if answer == "y":
-                    for dsname in nonempty:
-                        shutil.rmtree(os.path.join(args.eventdir, dsname))
-                    break
-                elif answer == "n":
-                    break
-
     # Create histdir and in case of errors, raise them now (before processing)
     os.makedirs(args.output, exist_ok=True)
     
@@ -252,51 +241,31 @@ def run_processor(processor_class=None, description=None, mconly=False):
         print("--metadata and --statedate can not be the same")
         sys.exit(1)
     if os.path.exists(args.statedata) and os.path.getsize(args.statedata) > 0:
+        if not args.resume:
+            print("Found old processor state file. Please either delete "
+                  f"'{args.statedata}' or specify --resume/-R")
+            sys.exit(1)
         mtime = datetime.fromtimestamp(os.stat(args.statedata).st_mtime)
-        while True:
-            answer = input(
-                f"Found old processor state from {mtime}. Load? y/n ")
-            if answer == "n":
-                print(f"Please delete/rename the old file {args.statedata} or "
-                      "use --statedata")
-                sys.exit(1)
-            elif answer == "y":
-                break
+        print(f"Loading old processor state made on {mtime}")
 
-    processor = Processor(config, args.eventdir)
     datasets = processor.preprocess(datasets)
     if args.condor is not None:
-        executor_class_pre = partial(
-            pepper.executor.ParslExecutor, allow_scalein=False)
-        executor_class = partial(
-            pepper.executor.ParslExecutor, allow_scalein=True)
-        if args.condorinit is not None:
-            with open(args.condorinit) as f:
-                condorinit = f.read()
-        else:
-            condorinit = None
-        if args.condorsubmit is not None:
-            with open(args.condorsubmit) as f:
-                condorsubmit = f.read()
-        else:
-            condorsubmit = None
-        print("Spawning jobs. This can take a while")
-        parsl_config = pepper.misc.get_parsl_config(
-            args.condor,
-            retries=args.retries,
-            condor_submit=condorsubmit,
-            condor_init=condorinit,
-            workers_per_job=args.condorworkers,
-            memory=args.memory
-            )
-        parsl.load(parsl_config)
-    else:
-        if args.condorinit is not None or args.condorsubmit is not None:
-            print(
-                "Ignoring condor parameters because --condor is not specified")
-        executor_class = executor_class_pre = pepper.executor.IterativeExecutor
-    pre_executor = executor_class_pre(state_file_name=args.metadata)
-    executor = executor_class(state_file_name=args.statedata)
+        pepper.htcondor.Cluster.set_global_config()
+    cluster = pepper.htcondor.Cluster(
+        args.condor,
+        condorsubmitfile=args.condorsubmit,
+        condorinit=args.condorinit,
+        retries=args.retries,
+        logdir=args.condorlogdir
+    )
+    pre_executor = pepper.executor.ClusterExecutor(
+        state_file_name=args.metadata,
+        cluster=cluster
+    )
+    executor = pepper.executor.ClusterExecutor(
+        state_file_name=args.statedata,
+        cluster=cluster
+    )
 
     try:
         pre_executor.load_state()
@@ -323,12 +292,32 @@ def run_processor(processor_class=None, description=None, mconly=False):
         chunksize = 500000
     userdata["chunksize"] = args.chunksize
 
-    runner = coffea.processor.Runner(
+    if args.condor is not None:
+        print(f"Dashboard available at {cluster.dashboard_link}")
+
+    runner = pepper.executor.Runner(
         executor, pre_executor, chunksize=chunksize, maxchunks=maxchunks,
         align_clusters=not args.force_chunksize, schema=processor.schema_class,
         xrootdtimeout=pepper.misc.XROOTDTIMEOUT)
+    xrootddomain = None
+    if "file_mode" in config and "xrootd" in config["file_mode"]:
+        xrootddomain = config["xrootddomain"]
+    bad_file_paths = None
+    if "bad_file_paths" in config:
+        bad_file_paths = config["bad_file_paths"]
+    metadata = {"store_path": store, "xrootddomain": xrootddomain,
+                "skippaths": bad_file_paths}
+    # Give metadata for the processing step
+    processor.pepperitemmetadata = metadata
+    # For the preprocessing step, add metadata also to the file meta
+    datasets = {k: {"files": v, "metadata": metadata}
+                for k, v in datasets.items()}
     output = runner(datasets, "Events", processor)
     processor.save_output(output, args.output)
+    if args.eventdir is not None:
+        print("If there were errors, please make sure to run "
+              "delete_duplicate_outputs.py for the per-event output in "
+              f"{args.eventdir}")
 
     return output
 
