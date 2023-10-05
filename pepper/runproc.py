@@ -6,6 +6,7 @@ import importlib
 import argparse
 import logging
 from datetime import datetime
+import shutil
 
 import pepper
 import pepper.executor
