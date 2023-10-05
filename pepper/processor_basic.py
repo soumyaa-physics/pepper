@@ -16,6 +16,21 @@ import pepper.config
 
 @dataclass
 class VariationArg:
+    """Holds information on a systematic variation of the jet energies
+
+    Attributes
+    ----------
+    name
+        Name of the variation
+    junc
+        First element names the jet energy uncertinty source, second element
+        names the direction in which it is varied
+    jer
+        Direction into which the jet energy resolution is varied. Can also be
+        "central" for no variation, but smearing still being applied
+    met
+        Direction into which the MET uncertainty is varied
+    """
     name: Optional[str] = None
     junc: Optional[Tuple[str, str]] = None
     jer: Optional[str] = "central"
@@ -32,17 +47,11 @@ class ProcessorBasicPhysics(pepper.Processor):
     config_class = pepper.ConfigBasicPhysics
 
     def __init__(self, config, eventdir):
-        """Create a new Processor
-
-        Arguments:
-        config -- A Config instance, defining the configuration to use
-        eventdir -- Destination directory, where the event HDF5s are saved.
-                    Every chunk will be saved in its own file. If `None`,
-                    nothing will be saved.
-        """
         super().__init__(config, eventdir)
 
     def get_jetmet_variation_args(self):
+        """Get a list of varations that should be done for the Jet/MET
+        uncertainties"""
         ret = []
         if ("jet_resolution" not in self.config
                 or "jet_ressf" not in self.config):
@@ -75,6 +84,7 @@ class ProcessorBasicPhysics(pepper.Processor):
         return ret
 
     def get_jetmet_nominal_arg(self):
+        """Get a ``VariationArg`` describing the nominal evaluation"""
         if "jet_resolution" in self.config and "jet_ressf" in self.config:
             return VariationArg(None)
         else:
@@ -90,6 +100,9 @@ class ProcessorBasicPhysics(pepper.Processor):
         return part
 
     def do_top_pt_reweighting(self, data):
+        """Top pt reweighting according to
+        https://twiki.cern.ch/twiki/bin/view/CMS/TopPtReweighting
+        """
         pt = data["gent_lc"].pt
         weiter = self.config["top_pt_reweighting"]
         rwght = weiter(pt[:, 0], pt[:, 1])
@@ -105,6 +118,7 @@ class ProcessorBasicPhysics(pepper.Processor):
                 return rwght
 
     def do_pileup_reweighting(self, dsname, data):
+        """Pileup reweighting"""
         ntrueint = data["Pileup"]["nTrueInt"]
         weighter = self.config["pileup_reweighting"]
         weight = weighter(dsname, ntrueint)
@@ -133,6 +147,11 @@ class ProcessorBasicPhysics(pepper.Processor):
             elif len(norm) == 8:
                 # Same as length 9, just missing the nominal weight at index 4
                 idx = [6, 1, 4, 3]
+            elif len(norm) == 18:
+                # Two sets of scale varations. From the titles in NanoAOD
+                # the exact order is not clear. Assume the right one comes
+                # first.
+                idx = [14, 2, 10, 6]
             else:
                 raise RuntimeError(
                     "Unexpected length of the norm for LHEScaleWeight: "
@@ -301,6 +320,8 @@ class ProcessorBasicPhysics(pepper.Processor):
         self.add_pdf_uncertainties(selector, data)
 
     def crosssection_scale(self, dsname, data):
+        """Cross section uncertainties. These are values depending only on the
+        data set"""
         num_events = len(data)
         lumifactors = self.config["mc_lumifactors"]
         factor = np.full(num_events, lumifactors[dsname])
@@ -332,6 +353,8 @@ class ProcessorBasicPhysics(pepper.Processor):
             return factor
 
     def blinding(self, is_mc, data):
+        """Skip every nth event in the experimental data. One way to blind your
+        analysis"""
         if not is_mc:
             return np.mod(data["event"], self.config["blinding_denom"]) == 0
         else:
@@ -395,6 +418,7 @@ class ProcessorBasicPhysics(pepper.Processor):
         return triggered
 
     def add_l1_prefiring_weights(self, data):
+        """Prefiring weights needed for 2016 and 2017 data"""
         w = data["L1PreFiringWeight"]
         nom = w["Nom"]
         if self.config["compute_systematics"]:
@@ -466,7 +490,9 @@ class ProcessorBasicPhysics(pepper.Processor):
         return has_id
 
     def electron_cuts(self, electron, good_lep):
-        """Apply some basic electron quality cuts."""
+        """Apply some basic electron quality cuts.
+        If good_lep is True, config values prefixed with 'good_' for pt and ID
+        are used. Otherwise the ones with prefix 'additional_' are used."""
         if self.config["ele_cut_transreg"]:
             sc_eta_abs = abs(electron["eta"]
                              + electron["deltaEtaSC"])
@@ -541,7 +567,10 @@ class ProcessorBasicPhysics(pepper.Processor):
         raise ValueError("Invalid muon iso string")
 
     def muon_cuts(self, muon, good_lep):
-        """Apply some basic muon quality cuts"""
+        """Apply some basic muon quality cuts
+        If good_lep is True, config values prefixed with 'good_' for pt, ID
+        and iso are used. Otherwise the ones with prefix 'additional_' are
+        used."""
         if self.config["muon_cut_transreg"]:
             is_in_transreg = self.in_transreg(abs(muon["eta"]))
         else:
@@ -574,31 +603,31 @@ class ProcessorBasicPhysics(pepper.Processor):
             )
             muons["pt"] = muons["pt"] * dtSF
         else:
-            hasgen = ~np.isnan(ak.fill_none(muons.matched_gen.pt, np.nan))
             # if reco pt has corresponding gen pt
             mcSF1 = self.config["muon_rochester"].kSpreadMC(
-                muons["charge"][hasgen],
-                muons["pt"][hasgen],
-                muons["eta"][hasgen],
-                muons["phi"][hasgen],
-                muons.matched_gen.pt[hasgen],
+                muons["charge"],
+                muons["pt"],
+                muons["eta"],
+                muons["phi"],
+                muons.matched_gen.pt,
             )
             # if reco pt has no corresponding gen pt
             counts = ak.num(muons["pt"])
             mc_rand = rng.uniform(size=ak.sum(counts))
             mc_rand = ak.unflatten(mc_rand, counts)
-            if pepper.misc.akismasked(muons):
-                mc_rand = ak.mask(mc_rand, ~ak.is_none(muons["pt"]))
             mcSF2 = self.config["muon_rochester"].kSmearMC(
-                muons["charge"][~hasgen],
-                muons["pt"][~hasgen],
-                muons["eta"][~hasgen],
-                muons["phi"][~hasgen],
-                muons["nTrackerLayers"][~hasgen],
-                mc_rand[~hasgen],
+                muons["charge"],
+                muons["pt"],
+                muons["eta"],
+                muons["phi"],
+                muons["nTrackerLayers"],
+                mc_rand,
             )
             # Combine the two scale factors and scale the pt
-            mcSF = ak.concatenate([mcSF1, mcSF2], axis=1)
+            mcSF = ak.where(
+                ak.is_none(muons.matched_gen.pt, axis=1), mcSF2, mcSF1)
+            # Remove masking from layout, none of the SF are masked here
+            mcSF = ak.fill_none(mcSF, 0)
             muons["pt"] = muons["pt"] * mcSF
         return muons
 
@@ -817,16 +846,16 @@ class ProcessorBasicPhysics(pepper.Processor):
         ret = {}
         if jec or (is_mc and (junc is not None or jer is not None)):
             ret["jetfac"] = factor
-        if jer is not None:
-            ret["jerfac"] = factor
+        if is_mc and jer is not None:
+            ret["jerfac"] = jerfac
         return ret
 
     def good_jet(self, data):
         """Apply some basic jet quality cuts."""
         jets = data["Jet"]
         leptons = data["Lepton"]
-        j_id, j_puId, lep_dist, eta_min, eta_max, pt_min = self.config[[
-            "good_jet_id", "good_jet_puId", "good_jet_lepton_distance",
+        j_id, lep_dist, eta_min, eta_max, pt_min = self.config[[
+            "good_jet_id", "good_jet_lepton_distance",
             "good_jet_eta_min", "good_jet_eta_max", "good_jet_pt_min"]]
         if j_id == "skip":
             has_id = True
@@ -840,6 +869,22 @@ class ProcessorBasicPhysics(pepper.Processor):
         else:
             raise pepper.config.ConfigError(
                     "Invalid good_jet_id: {}".format(j_id))
+
+        j_pt = jets.pt
+        if "jetfac" in ak.fields(data):
+            j_pt = j_pt * data["jetfac"]
+        has_lepton_close = ak.any(
+            jets.metric_table(leptons) < lep_dist, axis=2)
+
+        return (has_id
+                & (~has_lepton_close)
+                & (eta_min < jets.eta)
+                & (jets.eta < eta_max)
+                & (pt_min < j_pt))
+
+    def has_puid(self, jets):
+        """Whether jets satisfy the configured pileup ID"""
+        j_puId = self.config["good_jet_puId"]
         if j_puId == "skip":
             has_puId = True
         elif j_puId == "cut:loose":
@@ -853,20 +898,9 @@ class ProcessorBasicPhysics(pepper.Processor):
                     "Invalid good_jet_id: {}".format(j_puId))
         # Only apply PUID if pT < 50 GeV
         has_puId = has_puId | (jets.pt >= 50)
+        return has_puId
 
-        j_pt = jets.pt
-        if "jetfac" in ak.fields(data):
-            j_pt = j_pt * data["jetfac"]
-        has_lepton_close = ak.any(
-            jets.metric_table(leptons) < lep_dist, axis=2)
-
-        return (has_id & has_puId
-                & (~has_lepton_close)
-                & (eta_min < jets.eta)
-                & (jets.eta < eta_max)
-                & (pt_min < j_pt))
-
-    def build_jet_column(self, data):
+    def build_jet_column(self, is_mc, data):
         """Build a column of jets passing the jet quality cuts,
            including a 'btag' key (containing the value of the
            chosen btag discriminator) and a 'btagged' key
@@ -894,8 +928,18 @@ class ProcessorBasicPhysics(pepper.Processor):
                 "Invalid working point \"{}\" for {} in year {}".format(
                     wp, tagger, year))
         jets["btagged"] = jets["btag"] > getattr(wptuple, wp)
-
+        jets["pass_pu_id"] = self.has_puid(jets)
+        if is_mc:
+            # A jet is considered to be a pileup jet if there is no gen jet
+            # within Delta R < 0.4
+            jets["has_gen_jet"] = ak.fill_none(
+                jets.delta_r(jets.matched_gen) < 0.4, False)
         return jets
+
+    def jets_with_puid(self, data):
+        """Get all jets satisfying the configured pileup ID"""
+        jets = data["Jet"]
+        return jets[jets.pass_pu_id]
 
     def build_lowptjet_column(self, is_mc, junc, jer, rng, data):
         """Build a column of low-pt jets, needed to propagate jet
@@ -1003,11 +1047,11 @@ class ProcessorBasicPhysics(pepper.Processor):
 
     def in_hem1516(self, phi, eta):
         """Return mask to select objects in faulty sector of hadronic
-           calorimeter encap (HEM 15/16 issue)."""
+           calorimeter encap (HEM 15/16 issue in 2018 data)."""
         return ((-3.0 < eta) & (eta < -1.3) & (-1.57 < phi) & (phi < -0.87))
 
     def hem_cut(self, data):
-        """Keep objects without the HEM 15/16 issue."""
+        """Keep objects without the HEM 15/16 issue in 2018 data."""
         cut_ele = self.config["hem_cut_if_ele"]
         cut_muon = self.config["hem_cut_if_muon"]
         cut_jet = self.config["hem_cut_if_jet"]
@@ -1037,6 +1081,7 @@ class ProcessorBasicPhysics(pepper.Processor):
         return n >= self.config["lep_pt_num_satisfied"]
 
     def good_mass_lepton_pair(self, data):
+        """Which events have lepton pair mass required by the configuration"""
         return data["mll"] > self.config["mll_min"]
 
     def no_additional_leptons(self, is_mc, data):
@@ -1049,6 +1094,39 @@ class ProcessorBasicPhysics(pepper.Processor):
         """Require events with minimum number of jets."""
         return self.config["num_jets_atleast"] <= ak.num(data["Jet"])
 
+    def compute_puid_sys(self, central, weighter, wp, eta, pt,
+                         pass_puid, has_gen_jet, sf_type):
+        """Jet pileup ID systematic weights"""
+        up = weighter(wp, eta, pt, pass_puid, has_gen_jet, sf_type, "up")
+        down = weighter(wp, eta, pt, pass_puid, has_gen_jet, sf_type, "down")
+        return (up / central, down / central)
+
+    def jet_puid_sfs(self, data):
+        """Compute event weights and systematics, if requested, for the jet
+        pileup ID"""
+        # Only apply SFs to jets for which the PU ID cut is applied,
+        # i.e. pT < 50 GeV
+        jets = data["Jet"][data["Jet"].pt < 50]
+        wp = self.config["good_jet_puId"].split(":", 1)[1]
+        pass_puid = jets["pass_pu_id"]
+        has_gen_jet = jets["has_gen_jet"]
+        eta = jets.eta
+        pt = jets.pt
+        weighter = self.config["jet_puid_sf"]
+        systematics = {}
+        weight = weighter(wp, eta, pt, pass_puid, has_gen_jet, "eff")
+        if self.config["compute_systematics"]:
+            systematics["jet_puid_eff"] = self.compute_puid_sys(
+                weight, weighter, wp, eta, pt, pass_puid, has_gen_jet, "eff")
+        if weighter.has_mis_prob:
+            central = weighter(wp, eta, pt, pass_puid, has_gen_jet, "mis")
+            weight = weight * central
+            if self.config["compute_systematics"]:
+                systematics["jet_puid_mis"] = self.compute_puid_sys(
+                    weight, weighter, wp, eta, pt, pass_puid,
+                    has_gen_jet, "mis")
+        return weight, systematics
+
     def jet_pt_requirement(self, data):
         """Require jets with minimum pT threshold."""
         n = np.zeros(len(data))
@@ -1060,11 +1138,14 @@ class ProcessorBasicPhysics(pepper.Processor):
 
     def compute_btag_sys(self, central, up_name, down_name, weighter, wp, flav,
                          eta, pt, discr, efficiency):
+        """b tagging systematic weights"""
         up = weighter(wp, flav, eta, pt, discr, up_name, efficiency)
         down = weighter(wp, flav, eta, pt, discr, down_name, efficiency)
         return (up / central, down / central)
 
     def compute_weight_btag(self, data, efficiency="central", never_sys=False):
+        """Compute event weights and systematics, if requested, for the b
+        tagging"""
         jets = data["Jet"]
         wp = self.config["btag"].split(":", 1)[1]
         flav = jets["hadronFlavour"]
@@ -1158,11 +1239,15 @@ class ProcessorBasicPhysics(pepper.Processor):
             return accept
 
     def pick_lepton_pair(self, data):
-        # Sort so that we get the order [lepton, antilepton]
+        """Get one pair of leptons of opposite charge per event. The negative
+        lepton comes first"""
         return data["Lepton"][
             ak.argsort(data["Lepton"]["pdgId"], ascending=False)]
 
     def pick_bs_from_lepton_pair(self, data):
+        """Pick a bottom quark and a bottom antiquark that fit best to a pair
+        of leptons assuming they come from a top pair decay. This is using
+        the mlb histogram method"""
         recolepton = data["recolepton"]
         lep = recolepton[:, 0]
         antilep = recolepton[:, 1]
@@ -1194,36 +1279,37 @@ class ProcessorBasicPhysics(pepper.Processor):
                               axis=1)
 
     def ttbar_system(self, reco_alg, rng, data):
-        """Do ttbar reconstruction."""
+        """Do ttbar reconstruction, obtaining four vectors for top pairs
+        from their decay products"""
         lep = data["recolepton"][:, 0]
         antilep = data["recolepton"][:, 1]
         b = data["recob"][:, 0]
         antib = data["recob"][:, 1]
         met = data["MET"]
-
-        with uproot.open(self.config["reco_info_file"]) as f:
+        if reco_alg == "sonnenschein":
             if self.config["reco_num_smear"] is None:
                 energyfl = energyfj = 1
                 alphal = alphaj = 0
                 num_smear = 1
                 mlb = None
             else:
-                energyfl = f["energyfl"]
-                energyfj = f["energyfj"]
-                alphal = f["alphal"]
-                alphaj = f["alphaj"]
-                mlb = f["mlb"]
+                with uproot.open(self.config["reco_info_file"]) as f:
+                    energyfl = f["energyfl"]
+                    energyfj = f["energyfj"]
+                    alphal = f["alphal"]
+                    alphaj = f["alphaj"]
+                    mlb = f["mlb"]
                 num_smear = self.config["reco_num_smear"]
-            if reco_alg == "sonnenschein":
-                if isinstance(self.config["reco_w_mass"], (int, float)):
-                    mw = self.config["reco_w_mass"]
-                else:
+            if isinstance(self.config["reco_w_mass"], (int, float)):
+                mw = self.config["reco_w_mass"]
+            else:
+                with uproot.open(self.config["reco_info_file"]) as f:
                     mw = f[self.config["reco_w_mass"]]
-                if isinstance(self.config["reco_t_mass"], (int, float)):
-                    mt = self.config["reco_t_mass"]
-                else:
+            if isinstance(self.config["reco_t_mass"], (int, float)):
+                mt = self.config["reco_t_mass"]
+            else:
+                with uproot.open(self.config["reco_info_file"]) as f:
                     mt = f[self.config["reco_t_mass"]]
-        if reco_alg == "sonnenschein":
             top, antitop = sonnenschein(
                 lep, antilep, b, antib, met, mwp=mw, mwm=mw, mt=mt, mat=mt,
                 energyfl=energyfl, energyfj=energyfj, alphal=alphal,
@@ -1236,9 +1322,11 @@ class ProcessorBasicPhysics(pepper.Processor):
             raise ValueError(f"Invalid value for reco algorithm: {reco_alg}")
 
     def has_ttbar_system(self, data):
+        """Whether the recontruction of the ttbar system was successful"""
         return ak.num(data["recot"]) > 0
 
     def build_nu_column_ttbar_system(self, data):
+        """Get four momenta for the neutrinos coming from top pair decay"""
         lep = data["recolepton"][:, 0:1]
         antilep = data["recolepton"][:, 1:2]
         b = data["recob"][:, 0:1]

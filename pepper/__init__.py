@@ -1,3 +1,4 @@
+from pepper.hist_collection import HistCollection
 from pepper.hist_defns import HistDefinition
 from pepper import datasets
 from pepper.hdffile import HDF5File
@@ -18,6 +19,7 @@ from pepper.processor_stau_basic import ProcessorSTau as ProcessorSTau
 from pepper.config_stau import ConfigSTau as ConfigSTau
 
 __all__ = [
+    "HistCollection",
     "HistDefinition",
     "datasets",
     "HDF5File",

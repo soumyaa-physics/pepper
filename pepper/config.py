@@ -20,13 +20,16 @@ class Config(MutableMapping):
     def __init__(self, path, textparser=hjson.load, cwd="."):
         """Initialize the configuration.
 
-        Arguments:
-        path -- Path to the file containing the configuration
-        textparser -- Callable to be used to parse the text contained in
-                      path_or_file
-        cwd -- A path to use as the working directory for relative paths in the
-               config. The actual working directory of the process might change
-               e.g. after submitting to HTCondor
+        Parameters
+        ----------
+        path
+            Path to the file containing the configuration
+        textparser
+            Callable to be used to parse the text contained in ``path``
+        cwd
+            Path to use as the working directory for relative paths in the
+            config. The actual working directory of the process might change
+            e.g. after submitting to HTCondor
         """
         self._config_loaded = None
         self._path = os.path.realpath(path)
@@ -129,8 +132,16 @@ class Config(MutableMapping):
             return self._get(key)
 
     def __contains__(self, key):
-        return key in self._overwritten or (
-            key in self._config and self._config[key] is not None)
+        return (
+            # __setitem__ and not __delitem__
+            self._overwritten.get(key) is not None
+            or (
+                # In file config and not None
+                self._config.get(key) is not None and
+                # But only if not __delitem__
+                self._overwritten.get(key, True) is not None
+            )
+        )
 
     def __setitem__(self, key, value):
         self._overwritten[key] = value
@@ -163,17 +174,28 @@ class Config(MutableMapping):
                      return_inverse=False):
         """Helper method to access mc_datasets and exp_datasets more easily.
 
-        Arguments:
-        include -- List of dataset names to restrict the result to
-        exclude -- List of dataset names to exclude from the result
-        dstype -- Either 'any', 'mc' or 'data'. 'mc' restrcits the result to be
-                  from mc_datasets, while 'data' restricts to exp_datasets.
-                  'any' does not impose restrictions.
-        return_inverse -- Additionally return a mapping of path to dataset name
+        Parameters
+        ----------
+        include
+            List of dataset names to restrict the result to
+        exclude
+            List of dataset names to exclude from the result
+        dstype
+            Either 'any', 'mc' or 'data'. 'mc' restrcits the result to be
+            from mc_datasets, while 'data' restricts to exp_datasets.
+            'any' does not impose restrictions.
+        return_inverse
+            Additionally return a mapping of path to dataset name
 
-        Returns a dict mapping dataset names to lists of full paths to the
-        dataset's files. If return_inverse is true, also return the inverse
-        mapping.
+        Returns
+        ------
+        datasets
+            Maps data set names to lists of full paths to the
+            dataset's files. If return_inverse is true, also return the inverse
+            mapping
+        paths2dsname
+            Only if ``return_inverse`` is ``True``. Maps full paths to data set
+            names. The inverse of ``datasets``
         """
         if dstype not in ("any", "mc", "data"):
             raise ValueError("dstype must be either 'any', 'mc' or 'data'")
@@ -196,13 +218,9 @@ class Config(MutableMapping):
 
         mode = self["file_mode"] if "file_mode" in self else "local"
         store = self["store"] if "store" in self else None
-        xrootddomain = self["xrootddomain"] if "xrootddomain" in self else None
-        skippaths = (set(self["bad_file_paths"]) if "bad_file_paths" in self
-                     else set())
         logger.debug("Finding files for data sets")
         datasets, paths2dsname = pepper.datasets.expand_datasetdict(
-            datasets, store=store, mode=mode, xrootddomain=xrootddomain,
-            skippaths=skippaths)
+            datasets, store=store, mode=mode)
         missing_datasets = requested_datasets - datasets.keys()
         if len(missing_datasets) > 0:
             raise ConfigError("Could not find files for: "
@@ -211,3 +229,40 @@ class Config(MutableMapping):
             return datasets
         else:
             return datasets, paths2dsname
+
+    def get_paths_for_lfn(self, lfn):
+        """Get paths that can be used in ``uproot.open`` for a logical file
+        name
+        The results depends on the config parameters ``file_mode``, ``store``
+        and ``xrootddomain``.
+
+        Parameters
+        ----------
+        lfn
+            The logical file name, if prefixed with "cmslfn://", otherwise
+            it is treated a physical file name and included in the return value
+            as is
+
+        Returns
+        -------
+        filepaths
+            List of physical file names found for ``lfn``
+        """
+        store = None
+        xrootddomain = None
+        skippaths = self["bad_file_paths"] if "bad_file_paths" in self else\
+            None
+        filemode = self["file_mode"] if "file_mode" in self else "local"
+        if filemode == "local" or filemode == "local+xrootd":
+            store = self["store"]
+        if filemode == "xrootd" or filemode == "local+xrootd":
+            xrootddomain = self["xrootddomain"]
+
+        if lfn.startswith("cmslfn://"):
+            filepaths = pepper.datasets.resolve_lfn(lfn, store, xrootddomain)
+        else:
+            filepaths = [lfn]
+        if skippaths is not None:
+            filepaths = [p for p in filepaths if p not in skippaths]
+
+        return filepaths

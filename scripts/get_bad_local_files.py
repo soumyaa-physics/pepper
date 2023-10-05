@@ -34,9 +34,10 @@ def wait_and_check(path, timeout):
 
 
 parser = ArgumentParser(
-    description="Find files that exist in the store directory but are not "
-                "accessible. This is done either by searching all the "
-                "directories or by looking through text files of bad paths")
+    description="Search for NanoAOD files that exist in the store directory "
+    "but are not accessible, possibly due to technical issues. The output is "
+    "a JSON list usable the bad_file_paths config. Searching is done by "
+    "checking all NanoAOD files a config points to")
 parser.add_argument(
     "config", help="Path to the JSON config file containing the MC and "
     "experimental data set names")
@@ -46,8 +47,10 @@ parser.add_argument(
     "when searching bad files in directories and trying to open them. "
     "Default 5.")
 parser.add_argument(
-    "--processes", "-p", type=int, default=20, help="Number of processes to "
-    "use when searching in directories. Default 20")
+    "--processes", "-p", type=int, default=10, help="Number of processes to "
+    "use when searching in directories. Too high numbers can slow down the "
+    "file system, which may cause a file to be falsely identified as bad. "
+    "Default 10")
 parser.add_argument(
     "--no_search", "-n", action="store_true", help="Disable the search in "
     "directories")
@@ -59,6 +62,7 @@ args = parser.parse_args()
 
 config = pepper.ConfigBasicPhysics(args.config)
 config["file_mode"] = "local"
+config["bad_file_paths"] = []
 datasets = config.get_datasets()
 paths = []
 for dsname, dspaths in datasets.items():
