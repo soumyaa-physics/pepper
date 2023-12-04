@@ -28,6 +28,8 @@ class ConfigSTau(pepper.ConfigBasicPhysics):
                 "single_mu_trigger_sfs": self._get_singlemuon_trg_sfs,
                 "DY_lo_sfs": self._get_dy_lo_sfs,
                 "DY_jet_reweight": self._get_dy_jet_reweight,
+                "W_jet_reweight": self._get_w_jet_reweight,
+                "MET_trigger_sfs": self._get_trigger_sfs,
             }
         )
     
@@ -52,5 +54,17 @@ class ConfigSTau(pepper.ConfigBasicPhysics):
             hist = f[value[1]]
         return ScaleFactors.from_hist(hist, value[2], setoverflow=True)
     
+    def _get_trigger_sfs(self, value):
+        if not isinstance(value, list) or len(value) < 2:
+            raise pepper.config.ConfigError(
+                "scale factors needs to be list of 2-element-lists in "
+                "form of [rootfile, histname]")
+        with uproot.open(self._get_path(value[0])) as f:
+            hist = f[value[1]]
+        return ScaleFactors.from_hist(hist, value[2], setoverflow=True)
+    
     def _get_dy_jet_reweight(self, value):
+        return np.array(value[0], dtype=np.float64)
+    
+    def _get_w_jet_reweight(self, value):
         return np.array(value[0], dtype=np.float64)
