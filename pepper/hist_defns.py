@@ -124,18 +124,21 @@ class HistDefinition:
                 if unit is not None:
                     bin_config["label"] = \
                         bin_config.get("label", "") + f" ({unit})"
+                hist_type = bin_config.pop("type", "float")
                 if "lo" in bin_config:
-                    if (bin_config["n_or_arr"] ==
-                            bin_config["hi"] - bin_config["lo"]):
+                    if hist_type == "int":
                         bin_config.pop("n_or_arr")
                         bin = hi.axis.Integer(bin_config.pop("lo"),
                                               bin_config.pop("hi"),
                                               **bin_config)
-                    else:
+                    elif hist_type == "float":
                         bin = hi.axis.Regular(bin_config.pop("n_or_arr"),
                                               bin_config.pop("lo"),
                                               bin_config.pop("hi"),
                                               **bin_config)
+                    else:
+                        raise HistDefinitionError(
+                            f"Unknown histogram type: {hist_type}")
                 else:
                     bin = hi.axis.Variable(bin_config.pop("n_or_arr"),
                                            **bin_config)
@@ -244,7 +247,9 @@ class HistDefinition:
         ----------
         categorizations
             Add ``StrCategory`` axes to the histogram. The axes will be named
-            and labeled according to the keys of this dict
+            and labeled according to the keys of this dict. An exception is a
+            category named "dataset", which will be used to overwrite the
+            default dataset name.
         has_systematic
             If true, add an ``StrCategory`` axis called 'sys' for systematic
             uncertainties
@@ -256,8 +261,9 @@ class HistDefinition:
         """
         axes = self.axes.copy()
         for cat in categorizations.keys():
-            axes.append(
-                hi.axis.StrCategory([], name=cat, label=cat, growth=True))
+            if cat != "dataset":
+                axes.append(
+                    hi.axis.StrCategory([], name=cat, label=cat, growth=True))
         if has_systematic:
             axes.insert(0, hi.axis.StrCategory(
                 [], name="sys", label="Systematic", growth=True))
@@ -279,7 +285,8 @@ class HistDefinition:
             already in the definition. Its keys name the axes, while its values
             are lists of strings that name the inidivuals bins in the axes and
             the fields inside ``data`` to take masks from if an event belongs
-            to a category
+            to a category. If a category called "dataset" is supplied, this
+            will be used instead of the dsname.
         dsname
             Name of the data set from where the event data is
         is_mc
@@ -321,7 +328,10 @@ class HistDefinition:
                 else:
                     key = ax.default_key
                     cat_present[name] = {key: np.full(len(data), True)}
-        non_array_fills = {"dataset": dsname}
+        if "dataset" in categorizations:
+            non_array_fills = {}
+        else:
+            non_array_fills = {"dataset": dsname}
         for weightname, w in weight.items():
             if weightname is not None:
                 non_array_fills["sys"] = weightname
@@ -534,13 +544,15 @@ class DataPicker:
 
     @property
     def name(self):
-        """Printiple string identifying the data picker"""
+        """Principle string identifying the data picker"""
         name = ""
         for sel in self._method:
             if isinstance(sel, str):
                 name += sel.replace("/", "")
             elif isinstance(sel, list):
-                name += ",".join(sel)
+                # Output will contain multiple attributes of an object, just
+                # give the name of this object
+                break
             elif isinstance(sel, dict):
                 if "function" in sel:
                     name += sel["function"].replace("/", "")
@@ -552,7 +564,7 @@ class DataPicker:
                     name += "leading"
                     if isinstance(sel["leading"], tuple):
                         if (not isinstance(sel["leading"][0], int)
-                                or not isinstance(sel["leading"][0], int)):
+                                or not isinstance(sel["leading"][1], int)):
                             raise HistDefinitionError(
                                 "Invalid value for leading tuple. Must be int")
                         name += (str(sel["leading"][0]) + "-"

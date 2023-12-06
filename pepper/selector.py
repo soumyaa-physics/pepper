@@ -150,7 +150,7 @@ class Selector:
         self.cats = {}
 
         self._applying_cuts = True
-        self.add_cut("Before cuts", np.full(self.num, True))
+        self.add_cut("BeforeCuts", np.full(self.num, True))
         self._applying_cuts = applying_cuts
 
     @property
@@ -288,7 +288,9 @@ class Selector:
             full_arr = np.full(self.num, 1, dtype=arr.dtype)
             full_arr[mask] = arr
             return full_arr
-
+        if name in self.cutnames:
+            raise ValueError(f"A cut with the name '{name}' "
+                             "already exists")
         logger.info(f"Adding cut '{name}'"
                     + (" (no callback)" if no_callback else ""))
         if categories is not None:

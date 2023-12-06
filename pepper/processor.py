@@ -73,8 +73,23 @@ class Processor(coffea.processor.ProcessorABC):
         configuration for obvious errors, so that the user has an immediate
         error message.
         """
-        # Nothing to do here currently. Implemented in subclasses
-        pass
+        # Check for duplicate names in columns_to_save
+        column_names = []
+        if "columns_to_save" in config:
+            to_save = config["columns_to_save"]
+            if isinstance(to_save, dict):
+                spec = to_save.items()
+            else:
+                spec = zip([None] * len(to_save), to_save)
+            for key, specifier in spec:
+                if key is None:
+                    datapicker = pepper.hist_defns.DataPicker(specifier)
+                    key = datapicker.name
+                if key in column_names:
+                    raise pepper.config.ConfigError(
+                        f"Ambiguous column to save '{key}' (from {specifier})")
+                else:
+                    column_names.append(key)
 
     @staticmethod
     def _get_hists_from_config(config, key, todokey):
@@ -201,7 +216,7 @@ class Processor(coffea.processor.ProcessorABC):
 
     def _prepare_saved_columns(self, selector):
         """Creates an array to be saved as per-event data. The content is taken
-        from the selector's and the data pickers defined in the config."""
+        from the selectors and the data pickers defined in the config."""
         columns = {}
         if "columns_to_save" in self.config:
             to_save = self.config["columns_to_save"]
@@ -220,11 +235,15 @@ class Processor(coffea.processor.ProcessorABC):
                 continue
             if key is None:
                 key = datapicker.name
-            if key in columns:
-                raise pepper.config.ConfigError(
-                    f"Ambiguous column to save '{key}', (from {specifier})")
             columns[key] = item
         return ak.Array(columns)
+
+    def _prepare_saved_categories(self, selector):
+        cat_dict = defaultdict(dict)
+        for cat_name, cats in selector.cats.items():
+            for cat in cats:
+                cat_dict[cat_name][cat] = selector.data[cat]
+        return ak.Array(cat_dict)
 
     def _save_per_event_info_hdf5(
             self, dsname, selector, identifier, save_full_sys=True):
@@ -234,6 +253,10 @@ class Processor(coffea.processor.ProcessorABC):
         cutnames, cutflags = selector.get_cuts()
         out_dict["cutnames"] = cutnames
         out_dict["cutflags"] = cutflags
+        if ("save_categories_per_event" not in self.config or
+                self.config["save_categories_per_event"]):
+            out_dict["categories"] = \
+                self._prepare_saved_categories(selector)
         if (self.config["compute_systematics"] and save_full_sys
                 and selector.systematics is not None):
             out_dict["systematics"] = ak.flatten(selector.systematics,
@@ -284,28 +307,37 @@ class Processor(coffea.processor.ProcessorABC):
                                   save_full_sys=True):
         """Save the per-event info into a Root file"""
         out_dict = {"dsname": dsname, "identifier": str(identifier)}
-        events = self._prepare_saved_columns(selector)
-        # Workaround: Use ak.packed to make sure offset arrays of virtual
-        # arrays are not given to uproot. Uproot has a bug for these.
-        events = {f: ak.packed(events[f]) for f in ak.fields(events)}
-        additional = {}
         cutnames, cutflags = selector.get_cuts()
         out_dict["Cutnames"] = str(cutnames)
-        additional["cutflags"] = cutflags
-        if selector.systematics is not None:
-            additional["weight"] = selector.systematics["weight"]
-            if self.config["compute_systematics"] and save_full_sys:
-                for field in ak.fields(selector.systematics):
-                    additional[f"systematics_{field}"] = \
-                        selector.systematics[field]
+        if len(selector.data) > 0:
+            events = self._prepare_saved_columns(selector)
+            # Workaround: Use ak.packed to make sure offset arrays of virtual
+            # arrays are not given to uproot. Uproot has a bug for these.
+            events = {f: ak.packed(events[f]) for f in ak.fields(events)}
+            additional = {}
+            additional["cutflags"] = cutflags
+            if selector.systematics is not None:
+                additional["weight"] = selector.systematics["weight"]
+                if self.config["compute_systematics"] and save_full_sys:
+                    for field in ak.fields(selector.systematics):
+                        additional[f"systematics_{field}"] = \
+                            selector.systematics[field]
 
-        for key in additional.keys():
-            if key in events:
-                raise RuntimeError(
-                    f"branch named '{key}' already present in Events tree")
-        events.update(additional)
-        events = self._separate_masks_for_root(events)
-        out_dict["Events"] = events
+            for key in additional.keys():
+                if key in events:
+                    raise RuntimeError(
+                        f"branch named '{key}' already present in Events tree")
+            events.update(additional)
+            events = self._separate_masks_for_root(events)
+            out_dict["Events"] = events
+            if ("save_categories_per_event" not in self.config or
+                    self.config["save_categories_per_event"]):
+                cats = self._prepare_saved_categories(selector)
+                for cat in ak.fields(cats):
+                    out_dict[f"Categories/{cat}"] = \
+                        self._separate_masks_for_root(
+                            {f: ak.packed(cats[cat][f])
+                             for f in ak.fields(cats[cat])})
         with self._open_output(dsname, "root") as outf:
             for key in out_dict.keys():
                 outf[key] = out_dict[key]
@@ -578,15 +610,15 @@ class Processor(coffea.processor.ProcessorABC):
         """Save a histogram
 
         This method does the actual work and can be run
-        in paramell. This may take them due to having to sum histograms
+        in paralel. This may take some time due to having to sum histograms
         across different data sets and in case of the Root format, having
         to split into sub-histograms.
 
         Parameters
         ----------
         key
-            Key to be used in ``hist_col``. Touple with the first element being
-            the a cut name
+            Key to be used in ``hist_col``. Tuple with the first element being
+            the cut name
         histdict
             The histogram split into sub-histograms, one for each data set
         cuts
@@ -617,7 +649,7 @@ class Processor(coffea.processor.ProcessorABC):
             ext = ".coffea"
         else:
             raise ValueError(f"Invalid hist format: {format}")
-        fname = f"Cut {cutnum:03} {'_'.join(key)}{ext}"
+        fname = f"Cut_{cutnum:03}_{'_'.join(key)}{ext}"
         fname = fname.replace("/", "")
         key = key + (None,) * (len(hist_col.key_fields) - len(key))
         hist_col.save(key, hist_sum, fname, format, cats_present=cats_present)
