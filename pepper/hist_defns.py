@@ -50,6 +50,12 @@ def num(data):
     else:
         return ak.num(data)
 
+def pass_score(data, thr=None, return_obj=False):
+    if return_obj:
+        return data[data.disTauTag_score1 >= thr]
+    else: # just return the mask (needed for categories)
+        return data.disTauTag_score1 >= thr
+
 func_dict = {
     "sin": np.sin,
     "cos": np.cos,
@@ -80,6 +86,7 @@ func_dict = {
     "ones_like": ak.ones_like,
     "full_like": ak.full_like,
     "max_abs": max_abs,
+    "pass_score": pass_score,
 }
 
 
