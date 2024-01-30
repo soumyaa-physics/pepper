@@ -3,6 +3,15 @@ import awkward as ak
 import numpy as np
 from collections import defaultdict
 
+flavour_map = {
+    "undef" : [0],
+    "light" : [1,2,3],
+    "heavy" : [4,5],
+    "ele" : [11],
+    "mu" : [13],
+    "tau" : [15],
+    "g" : [21],
+}
 
 def not_arr(arr):
     """Element wise logical not"""
@@ -56,6 +65,13 @@ def pass_score(data, thr=None, return_obj=False):
     else: # just return the mask (needed for categories)
         return data.disTauTag_score1 >= thr
 
+def flav_any(data, n_jet, flav):
+    flav = flavour_map[flav]
+    jet = data[:, n_jet]
+    jet_pass = [jet == f for f in flav]
+    jet_pass = np.any(jet_pass, axis = 0)
+    return jet_pass
+        
 func_dict = {
     "sin": np.sin,
     "cos": np.cos,
@@ -87,6 +103,7 @@ func_dict = {
     "full_like": ak.full_like,
     "max_abs": max_abs,
     "pass_score": pass_score,
+    "flav_any": flav_any
 }
 
 

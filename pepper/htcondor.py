@@ -89,7 +89,7 @@ def get_site():
         return hostname
 
 
-def get_dask_cluster(num_jobs, runtime=3*60*60, memory="2 GB", disk="3 GB",
+def get_dask_cluster(num_jobs, runtime=7*60*60, memory="4 GB", disk="3 GB",
                      cores=1, *, condorsubmit=None, condorenv=None,
                      logdir=None, memorylimit=0):
     """Get a Dask Jobqueue HTCondor cluster for a host
@@ -143,7 +143,8 @@ def get_dask_cluster(num_jobs, runtime=3*60*60, memory="2 GB", disk="3 GB",
     # requested through Condor. Thus explicitly set RequestMemory.
     memory = dask.utils.parse_bytes(memory)
     job_extra_directives = {
-        "RequestMemory": str(int(memory / 2**20))
+        "RequestMemory": str(int(memory / 2**20)),
+        '+MaxRuntime': str(runtime)
     }
     if condorsubmit is not None:
         for param in condorsubmit.split("\n"):
@@ -168,7 +169,8 @@ def get_dask_cluster(num_jobs, runtime=3*60*60, memory="2 GB", disk="3 GB",
     site = get_site()
     config.update(site_config.get(site, {}))
     cluster = HTCondorCluster(**config)
-    cluster.adapt(maximum_jobs=num_jobs)
+    # cluster.adapt(maximum_jobs=num_jobs)
+    cluster.scale(jobs=num_jobs)
 
     return cluster
 
@@ -199,7 +201,7 @@ class Cluster:
     def __init__(
             self, num_jobs, condorsubmit=None, condorinit=None,
             logdir="pepper_logs", retries=None, condorsubmitfile=None,
-            memory="2 GB"):
+            memory="4 GB"):
         """
         Parameters
         ----------
