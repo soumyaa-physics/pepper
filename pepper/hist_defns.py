@@ -175,6 +175,10 @@ class HistDefinition:
             self.weight = config["weight"]
         else:
             self.weight = None
+        if "systematics" in config:
+            self.systematics = config["systematics"]
+        else:
+            self.systematics = None
         for axisname, method in config["fill"].items():
             if axisname in [b.name for b in bins]:
                 self.bin_fills[axisname] = method
@@ -311,7 +315,8 @@ class HistDefinition:
         weight
             Event weight as array
         """
-        has_systematic = self.weight is None and isinstance(weight, dict)
+        has_systematic = (self.systematics is not None or
+                          (self.weight is None and isinstance(weight, dict)))
         hist = self.create_hist(categorizations, has_systematic)
 
         fill_vals = {name: DataPicker(method)(data)
@@ -327,6 +332,13 @@ class HistDefinition:
                     "Weight specified in hist config not available")
         if not isinstance(weight, dict):
             weight = {None: weight}
+
+        if self.systematics is not None:
+            weight = {None: weight["None"]}
+            for name, sys in self.systematics.items():
+                sys_col = DataPicker(sys)(data)
+                if sys_col is not None:
+                    weight["name"] = sys_col
 
         categorizations = {name: {cat: [cat] for cat in cats}
                            for name, cats in categorizations.items()}
