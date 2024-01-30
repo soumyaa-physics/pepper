@@ -266,7 +266,7 @@ def expand_datasetdict(datasets, store=None, ignore_path=None, ext=".root",
         if ignore_path:
             processed_paths = []
             for path in paths:
-                if not ignore_path(path):
+                if not path in ignore_path:
                     processed_paths.append(path)
             paths = processed_paths
 

@@ -218,9 +218,11 @@ class Config(MutableMapping):
 
         mode = self["file_mode"] if "file_mode" in self else "local"
         store = self["store"] if "store" in self else None
+        skippaths = (set(self["bad_file_paths"]) if "bad_file_paths" in self
+                     else set())
         logger.debug("Finding files for data sets")
         datasets, paths2dsname = pepper.datasets.expand_datasetdict(
-            datasets, store=store, mode=mode)
+            datasets, store=store, mode=mode, ignore_path=list(skippaths))
         missing_datasets = requested_datasets - datasets.keys()
         if len(missing_datasets) > 0:
             raise ConfigError("Could not find files for: "

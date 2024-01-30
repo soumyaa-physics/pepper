@@ -132,9 +132,6 @@ def run_processor(processor_class=None, description=None, mconly=False):
         "the --output argument.", default=None
     )
     parser.add_argument(
-        "--memory", help="Memmory requested by the htcondor_job", default=None
-    )
-    parser.add_argument(
         "--logconf", help="Storing config state in the output folder", default=True
     )
     parser.add_argument(
@@ -233,6 +230,7 @@ def run_processor(processor_class=None, description=None, mconly=False):
     elif args.nfiles:
         print("Processing only nfiles per dataset because of --nfiles")
         datasets = {key: val[:int(args.nfiles)] for key, val in datasets.items()}
+        # print("Datasets after --nfiles:", datasets)
 
     if len(datasets) == 0:
         sys.exit("No datasets found")
