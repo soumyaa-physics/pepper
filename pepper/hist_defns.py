@@ -334,7 +334,7 @@ class HistDefinition:
             weight = {None: weight}
 
         if self.systematics is not None:
-            weight = {None: weight["None"]}
+            weight = {None: weight[None]}
             for name, sys in self.systematics.items():
                 sys_col = DataPicker(sys)(data)
                 if sys_col is not None:
