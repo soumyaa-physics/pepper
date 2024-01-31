@@ -123,7 +123,7 @@ class HistDefinition:
     categorizations (``StrCategory`` axes) on top of what is already in the
     definition."""
 
-    def __init__(self, config):
+    def __init__(self, config, compute_systematics):
         """
         Parameters
         ----------
@@ -175,7 +175,7 @@ class HistDefinition:
             self.weight = config["weight"]
         else:
             self.weight = None
-        if "systematics" in config:
+        if "systematics" in config and compute_systematics:
             self.systematics = config["systematics"]
         else:
             self.systematics = None
@@ -334,11 +334,11 @@ class HistDefinition:
             weight = {None: weight}
 
         if self.systematics is not None:
-            weight = {None: weight[None]}
+            weight = {"nominal": weight[None]}
             for name, sys in self.systematics.items():
                 sys_col = DataPicker(sys)(data)
                 if sys_col is not None:
-                    weight["name"] = sys_col
+                    weight["name"] = sys_col * weight["nominal"]
 
         categorizations = {name: {cat: [cat] for cat in cats}
                            for name, cats in categorizations.items()}

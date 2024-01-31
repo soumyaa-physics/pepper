@@ -104,7 +104,7 @@ class Config(MutableMapping):
 
     def _get_hists(self, value):
         hist_config = self._get_maybe_external(value)
-        return {k: HistDefinition(c) for k, c in hist_config.items()}
+        return {k: HistDefinition(c, self["compute_systematics"]) for k, c in hist_config.items()}
 
     def _get(self, key):
         if key in self._overwritten:
