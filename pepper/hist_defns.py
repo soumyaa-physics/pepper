@@ -338,7 +338,7 @@ class HistDefinition:
             for name, sys in self.systematics.items():
                 sys_col = DataPicker(sys)(data)
                 if sys_col is not None:
-                    weight["name"] = sys_col * weight["nominal"]
+                    weight[name] = sys_col * weight["nominal"]
 
         categorizations = {name: {cat: [cat] for cat in cats}
                            for name, cats in categorizations.items()}
