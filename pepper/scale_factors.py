@@ -875,3 +875,33 @@ class TopPtWeigter:
         sf = self.sffunc(toppt)
         antisf = self.sffunc(antitoppt)
         return np.sqrt(sf * antisf) * self.scale
+
+class TauScaleFactors:
+    """ Tau id efficiency scale factors according to
+    https://gitlab.cern.ch/cms-nanoAOD/jsonpog-integration/-/tree/master/POG/TAU?ref_type=heads
+    """
+    def __init__(self, filepath, tau_id, wp_VSjet, wp_VSe, sfs_type):
+        """
+        Parameters
+        ----------
+        filepath
+            Path to the json file containing the scale factors
+        tau_id
+            The tau id to be used. For example "DeepTau2017v2p1VSjet"
+        wp_VSjet
+            The working point for the tau id vs jet
+        wp_VSe
+            The working point for the tau id vs electron
+        type
+            The type of the scale factors. For example "pt" or "eta"
+        """
+        self.sf = correctionlib.CorrectionSet.from_file(filepath)
+        self.corr = self.sf[tau_id]
+        self.wp_VSjet = wp_VSjet
+        self.wp_VSe = wp_VSe
+        self.type = sfs_type
+    
+    def __call__(self, tau_pt, tau_dm, genmatch, syst):
+        sfs = self.corr.evaluate(tau_pt, tau_dm, genmatch, self.wp_VSjet, self.wp_VSe, syst, self.type)
+        return np.array(sfs)
+    

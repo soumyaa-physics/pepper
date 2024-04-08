@@ -5,7 +5,7 @@ import uproot
 import hjson
 
 import pepper
-from pepper.scale_factors import ScaleFactors
+from pepper.scale_factors import ScaleFactors, TauScaleFactors
 
 
 class ConfigSTau(pepper.ConfigBasicPhysics):
@@ -30,6 +30,7 @@ class ConfigSTau(pepper.ConfigBasicPhysics):
                 "DY_jet_reweight": self._get_dy_jet_reweight,
                 "W_jet_reweight": self._get_w_jet_reweight,
                 "MET_trigger_sfs": self._get_trigger_sfs,
+                "tauid_sfs": self._get_tauid_sfs
             }
         )
     
@@ -68,3 +69,10 @@ class ConfigSTau(pepper.ConfigBasicPhysics):
     
     def _get_w_jet_reweight(self, value):
         return np.array(value[0], dtype=np.float64)
+    
+    def _get_tauid_sfs(self, value):
+        if not isinstance(value, list) or len(value) != 5:
+            raise pepper.config.ConfigError(
+                "tau id scale factors needs to be list of 5-element-lists in "
+                "form of [rootfile, id, wpVSjet, wpVSe, type]")
+        return TauScaleFactors(self._get_path(value[0]), *value[1:])

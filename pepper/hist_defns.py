@@ -60,6 +60,8 @@ def num(data):
         return ak.num(data)
 
 def pass_score(data, thr=None, return_obj=False):
+    if len(data) == 0:
+        return ak.Array([])
     if return_obj:
         return data[data.disTauTag_score1 >= thr]
     else: # just return the mask (needed for categories)

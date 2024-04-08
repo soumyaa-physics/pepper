@@ -135,6 +135,9 @@ def run_processor(processor_class=None, description=None, mconly=False):
         "--logconf", help="Storing config state in the output folder", default=True
     )
     parser.add_argument(
+        "--logproc", help="Storing processor state in the output folder", default=True
+    )
+    parser.add_argument(
         "-R", "--resume", action="store_true", help="If present and the file "
         "pointed to by --statedata exists, load the file and resume from that "
         "state"
@@ -240,6 +243,8 @@ def run_processor(processor_class=None, description=None, mconly=False):
     
     if args.logconf:
         shutil.copyfile(args.config, f"{args.output}/config.json")
+    if args.logproc:
+        shutil.copyfile(args.processor, f"{args.output}/processor.py")
 
     if args.statedata is None:
         statedata = os.path.join(args.output, "pepper_state.coffea")
