@@ -25,8 +25,8 @@ class ConfigSTau(pepper.ConfigBasicPhysics):
         self.behaviors.update(
             {
                 "jet_fake_rate": self._get_jet_fake_rate,
-                "single_mu_trigger_sfs": self._get_singlemuon_trg_sfs,
-                "DY_lo_sfs": self._get_dy_lo_sfs,
+                "muon_sf_trigger": self._get_singlemuon_trg_sfs,
+                "DY_ZptLO_weights": self._get_dy_lo_sfs,
                 "DY_jet_reweight": self._get_dy_jet_reweight,
                 "W_jet_reweight": self._get_w_jet_reweight,
                 "MET_trigger_sfs": self._get_trigger_sfs,
