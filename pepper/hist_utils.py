@@ -41,7 +41,7 @@ def group_histogram(h, old_axis, new_axis, mapping):
     if ax_index is None:
         raise ValueError(f"Axes {old_axis} not found in histogram!")
 
-    h_new = hist.Hist(*new_axes, name=h.name, storage=h._storage_type())
+    h_new = hist.Hist(*new_axes, name=h.name, storage=h.storage_type())
     h_new_view = h_new.view(flow=True)
 
     categories_in_hist = list(h.axes[old_axis])
