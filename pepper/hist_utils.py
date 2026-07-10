@@ -41,7 +41,7 @@ def group_histogram(h, old_axis, new_axis, mapping):
     if ax_index is None:
         raise ValueError(f"Axes {old_axis} not found in histogram!")
 
-    h_new = hist.Hist(*new_axes, name=h.name, storage=h._storage_type())
+    h_new = hist.Hist(*new_axes, name=h.name, storage=h.storage_type())
     h_new_view = h_new.view(flow=True)
 
     categories_in_hist = list(h.axes[old_axis])
@@ -108,7 +108,7 @@ def rebin_histogram(h, axis_name, edges, new_axis_label=None):
     axes = list(h.axes)
     axes[ax_idx] = new_ax
 
-    hnew = hist.Hist(*axes, name=h.name, storage=h._storage_type())
+    hnew = hist.Hist(*axes, name=h.name, storage=h.storage_type())
 
     # Offset from bin edge to avoid numeric issues
     offset = 0.5*np.min(ax.edges[1:]-ax.edges[:-1])
@@ -136,7 +136,7 @@ def rebin_histogram(h, axis_name, edges, new_axis_label=None):
             indices=range(new_ax.size+underflow+overflow),
             axis=ax_idx
         )
-    if hnew._storage_type() == hist.storage.Weight():
+    if hnew.storage_type() == hist.storage.Weight():
         hnew.variances(flow=flow)[...] = np.add.reduceat(
                 h.variances(flow=flow),
                 edge_idx,
