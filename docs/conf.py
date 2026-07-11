@@ -36,7 +36,6 @@ extensions = [
     "sphinx.ext.autosummary",
     "sphinx.ext.napoleon",
     "sphinx.ext.extlinks",
-    "sphinx_autodoc_typehints",
     "sphinx_design",
     "sphinx_copybutton",
     "sphinxcontrib.mermaid",
@@ -52,6 +51,8 @@ autodoc_default_options = {
     'special-members': '__init__',
     'show-inheritance': True,
 }
+autodoc_typehints = "description"
+autodoc_typehints_format = "short"
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
