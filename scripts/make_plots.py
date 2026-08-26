@@ -3,7 +3,7 @@ Plotting script for pepper histogram output.
 Can read both ROOT and hist (.coffea) histograms.
 
 Steered via a plot_config.json file
-(see `config_documentation.md` for format.)
+(see https://cms-pepper.docs.cern.ch/examples/bundled_scripts.html#step-8-plotting)
 
 While it is quite flexible, it is not meant as a one-fits-all
 solution, but instead should be extended and adapted to the needs
@@ -516,8 +516,7 @@ parser.add_argument(
     "plot a given cut (i.e. only 'Req MET'.)")
 parser.add_argument(
     "-j", "--jobs", type=int, default=1, help="Parallelize over given "
-    "number of jobs. Default 1"
-)
+    "number of jobs. Default 1")
 args = parser.parse_args()
 
 if args.ext is None:

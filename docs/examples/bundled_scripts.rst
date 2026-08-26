@@ -207,13 +207,21 @@ The plotting configuration (:repo:`example/example_plotting.json` is a small sta
 into stacked categories, defines data, controls rebinning, axis labels, and signal overlays. The script reads each 
 histogram from ``hists.json`` and writes one plot per histogram into the output directory.
  
-Pass ``--log`` for log-scale axes and ``--ext png`` (or ``svg``, ``pdf``) to control the output format. 
-``--cut`` restricts plotting to a single cutflow stage, which is useful for iterating on plot styling without
-producing the full set every time.
+Pass ``--log`` for log-scale axes and ``--ext png`` (or ``svg``, ``pdf``; can be specified multiple times to output 
+multiple formats) to control the output format. ``--cut`` restricts plotting to a single cutflow stage, which is 
+useful for iterating on plot styling without producing the full set every time. To speed up processing, use ``-j``
+or ``--jobs`` to parallelize the workload over a specific number of jobs.
  
 The script is deliberately not a one-size-fits-all solution. Once you need plots that fall outside its capabilities, 
 the recommended path is to copy the script into your analysis repository and adapt it - the helper functions in 
 :mod:`pepper.hist_utils` (rebinning, grouping, projecting) are intended for direct use in your own plotting code as well.
+
+In case of 2D histograms, use ``make_plots_2D.py`` instead, which has a similar interface but is designed for the special
+needs of 2D histograms.
+
+.. code-block:: bash
+ 
+   python scripts/make_plots_2D.py example_plotting.json prod_v1/hists.json --outdir plots
  
  
 Step 9: Cleanup
