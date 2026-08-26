@@ -108,9 +108,11 @@ def lfn_to_xrootd_path(lfn, xrootddomain):
     return f"root://{xrootddomain}/" + lfn
 
 
-def resolve_lfn(lfn, store=None, xrootddomain=None, url_blacklist=None,
-                use_eos_redirector=True, url_priority=None):
-    """Get paths and URLs for a file given a specific logical file name (LFN).
+def locate_lfn(lfn, store=None, xrootddomain=None, use_eos_redirector=True):
+    """Get all known paths and URLs for a logical file name (LFN), without
+    ``url_priority``/``url_blacklist`` reordering/filtering (see
+    ``apply_url_priority_and_blacklist``) - local path first if present,
+    then XRootD locations in ``locate()`` order.
 
     Parameters
     ----------
@@ -121,15 +123,9 @@ def resolve_lfn(lfn, store=None, xrootddomain=None, url_blacklist=None,
         See ``expand_datasetdict``
     xrootddomain
         See ``expand_datasetdict``
-    url_blacklist
-        Optional; a blacklist of XRootD URLs which should not be used for
-        resolving the file
     use_eos_redirector
         If True and the file is located on EOS, the EOS redirector URL will
         be used instead of the direct EOS path.
-    url_priority
-        Optional; a list of strings. If given, XRootD URLs containing any of
-        these strings will be preferred over other URLs for the same file.
 
     Returns
     -------
@@ -155,22 +151,82 @@ def resolve_lfn(lfn, store=None, xrootddomain=None, url_blacklist=None,
         if loc is None:
             raise OSError("XRootD error: " + status.message)
         domains = [r.address for r in loc]
-        if url_priority is not None:
-            domains_sorted = []
-            for url in url_priority:
-                for d in domains:
-                    if url in d and d not in domains_sorted:
-                        domains_sorted.append(d)
-            domains_sorted.extend(d for d in domains if d not in domains_sorted)
-            domains = domains_sorted
-        if url_blacklist is not None:
-            domains = [d for d in domains if not any(
-                    blacklisted in d for blacklisted in url_blacklist)]
-            if len(domains) == 0:
-                raise ValueError("All domains are on the blacklist for LFN "
-                                 + lfn)
         pfns.extend(f"root://{d}/{lfn}" for d in domains)
     return pfns
+
+
+def apply_url_priority_and_blacklist(pfns, url_blacklist=None, url_priority=None):
+    """Reorder and filter the XRootD URLs in a list of paths/URLs as
+    returned by ``locate_lfn``, according to ``url_priority``/
+    ``url_blacklist``. Local paths (i.e. not starting with "root://") are
+    left untouched and stay first.
+
+    Parameters
+    ----------
+    pfns
+        List of paths/URLs, as returned by ``locate_lfn``
+    url_blacklist
+        Optional; a blacklist of XRootD URLs which should not be used for
+        resolving the file
+    url_priority
+        Optional; a list of strings. If given, XRootD URLs containing any of
+        these strings will be preferred over other URLs for the same file.
+
+    Returns
+    -------
+        Reordered and filtered list of paths/URLs.
+    """
+    local = [p for p in pfns if not p.startswith("root://")]
+    domains = [p for p in pfns if p.startswith("root://")]
+    if url_priority is not None:
+        domains_sorted = []
+        for url in url_priority:
+            for d in domains:
+                if url in d and d not in domains_sorted:
+                    domains_sorted.append(d)
+        domains_sorted.extend(d for d in domains if d not in domains_sorted)
+        domains = domains_sorted
+    if url_blacklist is not None:
+        domains_before = domains
+        domains = [d for d in domains if not any(
+                blacklisted in d for blacklisted in url_blacklist)]
+        if len(domains_before) > 0 and len(domains) == 0:
+            raise ValueError("All XRootD URLs are on the blacklist for: "
+                             + ", ".join(domains_before))
+    return local + domains
+
+
+def resolve_lfn(lfn, store=None, xrootddomain=None, url_blacklist=None,
+                use_eos_redirector=True, url_priority=None):
+    """Get paths and URLs for a file given a specific logical file name (LFN).
+    Equivalent to calling ``locate_lfn`` followed by
+    ``apply_url_priority_and_blacklist``.
+
+    Parameters
+    ----------
+    lfn
+        Logical file name of the file, normally starts with "/store/". This
+        function ccepts the additional prefix "cmslfn://store/".
+    store
+        See ``expand_datasetdict``
+    xrootddomain
+        See ``expand_datasetdict``
+    url_blacklist
+        Optional; a blacklist of XRootD URLs which should not be used for
+        resolving the file
+    use_eos_redirector
+        If True and the file is located on EOS, the EOS redirector URL will
+        be used instead of the direct EOS path.
+    url_priority
+        Optional; a list of strings. If given, XRootD URLs containing any of
+        these strings will be preferred over other URLs for the same file.
+
+    Returns
+    -------
+        List of valid paths and URLs for the given logical file name.
+    """
+    pfns = locate_lfn(lfn, store, xrootddomain, use_eos_redirector)
+    return apply_url_priority_and_blacklist(pfns, url_blacklist, url_priority)
 
 
 def dataset_to_lfns(dataset, store=None, ext=".root", mode="local"):

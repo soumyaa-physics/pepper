@@ -341,24 +341,39 @@ def run_processor(processor_class=None, description=None, mconly=False):
     use_eos_redirector = config.get("use_eos_redirector", True)
     xrootd_url_priority = config.get("xrootd_url_priority", None)
     use_buffer_cache = config.get("use_buffer_cache", True)
+    resolve_files_at_preprocess = config.get("resolve_files_at_preprocess", False)
+    resolve_files_max_age_days = config.get("resolve_files_max_age_days", 90)
     metadata = {"store_path": store, "xrootddomain": xrootddomain,
                 "local_file_blacklist": local_file_blacklist,
                 "url_blacklist": xrootd_url_blacklist,
                 "use_eos_redirector": use_eos_redirector,
                 "url_priority": xrootd_url_priority,
                 "use_buffer_cache": use_buffer_cache,
-                "check_can_open_local": check_can_open_local
+                "check_can_open_local": check_can_open_local,
+                "resolve_files_at_preprocess": resolve_files_at_preprocess,
+                "resolve_files_max_age_days": resolve_files_max_age_days
                 }
+
+    if resolve_files_at_preprocess:
+        # Re-fetch and re-persist any expired resolved_filepaths entries.
+        pepper.executor.purge_stale_resolved_filepaths(
+            pre_executor, datasets, "Events", resolve_files_max_age_days)
 
     # For the preprocessing step, add metadata also to the file meta
     datasets = {k: {"files": v, "metadata": metadata}
                 for k, v in datasets.items()}
     preprocess_output = runner.preprocess(datasets, treename="Events")
-    # Add up-to-date metadata to WorkItems, needed in case it was
-    # loaded from pepper_metadata.coffea
-    preprocess_output = [
-        dataclasses.replace(item, usermeta=metadata) for item in preprocess_output
-    ]
+    # Refresh WorkItem metadata from config, but keep each item's own
+    # resolved_filepaths/resolved_filepaths_time from preprocessing.
+    new_preprocess_output = []
+    for item in preprocess_output:
+        usermeta = dict(metadata)
+        if item.usermeta and "resolved_filepaths" in item.usermeta:
+            usermeta["resolved_filepaths"] = item.usermeta["resolved_filepaths"]
+        if item.usermeta and "resolved_filepaths_time" in item.usermeta:
+            usermeta["resolved_filepaths_time"] = item.usermeta["resolved_filepaths_time"]
+        new_preprocess_output.append(dataclasses.replace(item, usermeta=usermeta))
+    preprocess_output = new_preprocess_output
 
     if args.trace:
         logger.info("Tracing columns to preload...")

@@ -14,7 +14,7 @@ import coffea.processor
 import coffea.util
 from coffea.processor import CheckpointerABC
 from coffea.processor.executor import _compression_wrapper, _decompress
-from coffea.processor.accumulator import iadd as accum_iadd
+from coffea.processor.accumulator import iadd as accum_iadd, set_accumulator
 from coffea.processor import ProcessorABC
 from coffea.nanoevents import schemas, NanoEventsFactory
 from coffea.nanoevents.trace import trace
@@ -390,15 +390,64 @@ class Runner(coffea.processor.Runner):
     """
 
     @staticmethod
+    def _resolved_filepaths_are_fresh(resolved_filepaths_time, max_age_days):
+        """Whether a ``resolved_filepaths_time`` timestamp is within
+        ``max_age_days`` (days, or ``False`` for no expiry)."""
+        if max_age_days is False:
+            return True
+        if resolved_filepaths_time is None:
+            # Missing timestamp - treat as stale rather than trust it.
+            return False
+        return (time.time() - resolved_filepaths_time) < max_age_days * 86400
+
+    @staticmethod
+    def _locate_lfn(lfn, metadata):
+        """Get raw candidate paths for ``lfn`` (local path first, then
+        XRootD locations in ``locate()`` order), unfiltered/unprioritized.
+        A non-LFN ``lfn`` is returned as ``[lfn]``.
+
+        Uses the cached ``metadata["resolved_filepaths"]`` instead of
+        calling XRootD if ``resolve_files_at_preprocess`` is set and the
+        cache is still fresh (see ``_resolved_filepaths_are_fresh``); a
+        stale cache here only skips using it for this call -
+        ``purge_stale_resolved_filepaths`` handles actually regenerating it.
+        """
+        if not lfn.startswith("cmslfn://"):
+            return [lfn]
+        if (metadata.get("resolve_files_at_preprocess", False)
+                and "resolved_filepaths" in metadata
+                and Runner._resolved_filepaths_are_fresh(
+                    metadata.get("resolved_filepaths_time"),
+                    metadata.get("resolve_files_max_age_days", 90))):
+            return metadata["resolved_filepaths"]
+        return pepper.datasets.locate_lfn(
+            lfn, metadata["store_path"], metadata["xrootddomain"],
+            metadata.get("use_eos_redirector", True))
+
+    @staticmethod
+    def _filter_and_prioritize(lfn, pfns, metadata):
+        """Apply ``url_priority``/``url_blacklist``/``local_file_blacklist``
+        to candidate paths from ``_locate_lfn``. Always applied fresh, so
+        config changes take effect even if ``pfns`` came from a cache."""
+        if lfn.startswith("cmslfn://"):
+            pfns = pepper.datasets.apply_url_priority_and_blacklist(
+                pfns, metadata["url_blacklist"], metadata.get("url_priority", None))
+        local_file_blacklist = metadata["local_file_blacklist"]
+        if metadata["xrootddomain"] is not None and local_file_blacklist is not None:
+            pfns = [p for p in pfns if p not in local_file_blacklist]
+        return pfns
+
+    @staticmethod
     def _try_open_and_process(item, metadata, callable):
-        filepaths = Runner.resolve_lfn(item.filename, metadata)
+        raw_pfns = Runner._locate_lfn(item.filename, metadata)
+        filepaths = Runner._filter_and_prioritize(item.filename, raw_pfns, metadata)
         for filepath in filepaths:
             # We check outside of the try-except block, because if a local file cannot be opened,
             # we directly want to raise an error. Currently, no remote files are added to filepaths list
             # if a local file is available.
             _raise_if_cant_open_local(filepath, metadata["check_can_open_local"])
             try:
-                return callable(filepath)
+                return callable(filepath), raw_pfns
 
             except OSError as e:
                 logger.warning(
@@ -427,19 +476,8 @@ class Runner(coffea.processor.Runner):
         filepaths
             Physical file paths associated to ``lfn``
         """
-        xrootddomain = metadata["xrootddomain"]
-        if lfn.startswith("cmslfn://"):
-            filepaths = pepper.datasets.resolve_lfn(lfn, metadata["store_path"], xrootddomain,
-                                                    metadata["url_blacklist"],
-                                                    metadata.get("use_eos_redirector", True),
-                                                    metadata.get("url_priority", None))
-        else:
-            filepaths = [lfn]
-        local_file_blacklist = metadata["local_file_blacklist"]
-        if xrootddomain is not None and local_file_blacklist is not None:
-            filepaths = [p for p in filepaths if p not in local_file_blacklist]
-
-        return filepaths
+        pfns = Runner._locate_lfn(lfn, metadata)
+        return Runner._filter_and_prioritize(lfn, pfns, metadata)
 
     @staticmethod
     def metadata_fetcher_root(xrootdtimeout, align_clusters, uproot_options, item):
@@ -453,7 +491,14 @@ class Runner(coffea.processor.Runner):
             out_acc.add(file_meta)
             return out_acc
 
-        return Runner._try_open_and_process(item, item.metadata, _work_function_inner)
+        out_acc, raw_pfns = Runner._try_open_and_process(item, item.metadata, _work_function_inner)
+        # Cache raw paths for resolve_files_at_preprocess; safe to mutate,
+        # coffea gives us a fresh per-file dict here.
+        file_meta = out_acc.pop()
+        file_meta.metadata["resolved_filepaths"] = raw_pfns
+        file_meta.metadata["resolved_filepaths_time"] = time.time()
+        out_acc.add(file_meta)
+        return out_acc
 
     @staticmethod
     def _open_file_context(
@@ -538,7 +583,8 @@ class Runner(coffea.processor.Runner):
                 out = processor_instance.process(events)
             return {"out": out}
 
-        return Runner._try_open_and_process(item, item.usermeta, _work_function_inner)
+        result, _ = Runner._try_open_and_process(item, item.usermeta, _work_function_inner)
+        return result
 
     def do_type_tracing(self, fileset, processor_instance):
         # for now: pick a random item from the fileset for tracing
@@ -567,4 +613,55 @@ class Runner(coffea.processor.Runner):
                 necessary_columns = trace(processor_instance.process, events)
             return necessary_columns
 
-        return Runner._try_open_and_process(item_to_process, metadata, _work_function_inner)
+        result, _ = Runner._try_open_and_process(item_to_process, metadata, _work_function_inner)
+        return result
+
+
+def purge_stale_resolved_filepaths(pre_executor, datasets, treename, max_age_days):
+    """Remove stale ``resolved_filepaths`` entries (older than
+    ``max_age_days``) for ``datasets``' files from ``pre_executor.state``,
+    so the next ``Runner.preprocess()`` re-fetches and re-persists them
+    instead of workers working around a stale cache forever.
+
+    Must run before ``preprocess()``: coffea only skips re-fetching a file
+    if its key is in ``state["items_done"]``, regardless of staleness, and
+    since ``FileMeta`` equality ignores ``.metadata``, a stale entry has to
+    be removed from both ``items_done`` and ``state["accumulator"]`` or a
+    freshly re-fetched one would silently fail to replace it in the set.
+    Only ``datasets``' own files are touched, so other datasets sharing the
+    same ``--metadata`` cache are left alone.
+
+    Parameters
+    ----------
+    pre_executor
+        The ``ResumableExecutor`` to use as ``pre_executor`` for preprocessing
+    datasets
+        ``{dataset: [file, file, ...]}``, same mapping about to be fed into
+        ``Runner.preprocess()``
+    treename
+        Tree name preprocessing will use
+    max_age_days
+        See ``Runner._resolved_filepaths_are_fresh``
+    """
+    accumulator = pre_executor.state.get("accumulator")
+    if not accumulator:
+        return
+    current_run_keys = {
+        coffea.processor.executor.FileMeta(dsname, filename, treename)
+        for dsname, filenames in datasets.items() for filename in filenames
+    }
+    stale = {
+        filemeta for filemeta in accumulator
+        if filemeta in current_run_keys
+        and not Runner._resolved_filepaths_are_fresh(
+            (filemeta.metadata or {}).get("resolved_filepaths_time"), max_age_days)
+    }
+    if not stale:
+        return
+    logger.info(f"Re-resolving file locations for {len(stale)} file(s) "
+                "with an expired resolved_filepaths cache")
+    pre_executor.state["accumulator"] = set_accumulator(
+        fm for fm in accumulator if fm not in stale)
+    pre_executor.state["items_done"] = [
+        item for item in pre_executor.state["items_done"] if item not in stale
+    ]

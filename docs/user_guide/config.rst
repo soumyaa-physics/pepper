@@ -139,11 +139,33 @@ Data Sets
   stable. Default is ``true``.
 
 ``check_can_open_local_files``: (bool, optional)
-   If true, Pepper will check if local files can be opened before trying to access them. 
-   The access is done by trying to read the first few bytes of the file. In case the file cannot be opened, 
-   an ``IOError`` will be raised. Default is ``false`` for performance reasons, but can be set to ``true`` 
+   If true, Pepper will check if local files can be opened before trying to access them.
+   The access is done by trying to read the first few bytes of the file. In case the file cannot be opened,
+   an ``IOError`` will be raised. Default is ``false`` for performance reasons, but can be set to ``true``
    for debugging or in environments where file accessibility is uncertain and the user does not
    want to risk hanging file reads.
+
+``resolve_files_at_preprocess``: (bool, optional)
+   Normally, each worker looks up all known physical locations (replicas)
+   for a logical file name (LFN) itself, via XRootD, right before opening
+   the file. This is always up to date but can be slow or cause timeouts if the
+   redirector is busy. If true, this XRootD lookup is instead done once
+   per file during preprocessing, and the full, unfiltered list of known
+   replicas is sent to the workers. Workers still apply
+   ``xrootd_url_priority``/``xrootd_url_blacklist``/``local_file_blacklist``
+   themselves and try the resulting candidates in the same order as usual.
+   This trades up-to-date knowledge of which replicas exist for
+   speed/reliability. Default is ``false``.
+
+``resolve_files_max_age_days``: (int or ``false``, optional)
+   Only relevant when ``resolve_files_at_preprocess`` is true. The maximum
+   age, in days, of a file's cached replica list before it is considered
+   obsolete. Once a file's cache entry is older than this, the next time
+   preprocessing runs for its dataset, that file's replica list is looked
+   up again via XRootD and the result is written back into the
+   preprocessing metadata cache (``--metadata``). Default is ``90``
+   (~3 months). Set to ``false`` to disable expiry and keep a cached
+   replica list forever once resolved.
 
 .. _config-store:
 
