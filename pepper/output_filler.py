@@ -291,6 +291,9 @@ class OutputFiller:
         else:
             weight = None
         for histname, fill_func in self.hist_dict.items():
+            # Check if data is blinded for this histogram
+            if getattr(fill_func, "blind_data", False) and not self.is_mc:
+                continue
             if (fill_func.step_requirement is not None
                     and fill_func.step_requirement not in done_steps):
                 continue

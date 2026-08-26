@@ -501,6 +501,9 @@ If ``fill`` is missing, the histogram will not be filled.
    giving ``{"channel": ["is_ee", "is_mm"]}`` would fill the histogram only for the ``ee`` and ``mumu``
    channels. If only a single value is given, encasing it in a list is optional (i.e. ``{"channel": "is_em"}`` is accepted).
 
+``blind_data`` (bool, optional)
+   If ``true``, data is blinded (i.e. not added to the histogram). Default: ``false``.
+
 ^^^^^^^^^^^^^^^^^^^^
 Data Pickers
 ^^^^^^^^^^^^^^^^^^^^

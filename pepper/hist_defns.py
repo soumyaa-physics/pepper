@@ -187,6 +187,7 @@ class HistDefinition:
             self.only_for_cats = config["only_for_cats"]
         else:
             self.only_for_cats = None
+        self.blind_data = config.get("blind_data", False)
 
     @staticmethod
     def _prepare_fills(fill_vals):
