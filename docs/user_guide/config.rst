@@ -326,7 +326,7 @@ optional parameter is missing, the corresponding procedure will be skipped.
    Second element: jet type used in the analysis (``AK4PUPPI``, or ``AK4CHS``)
 
 ``jet_veto_map`` (array, optional)
-  The jet veto map to apply, given in correctionlib format. Must be a list of the form ``[filepath, correction_name, extra_arg_dict]``. As of writing, required extra arguments for the JME-provided maps are ``{"type": "jetvetomap"}``.
+  The jet veto map to apply, given in correctionlib format. Must be a list of the form ``[filepath, correction_name, extra_arg_dict]``. As of writing, required extra arguments for the JME-provided maps are ``{"type": "jetvetomap"}``. The same veto map will be used for both jets and fat jets.
 
 ``jet_puid_sf`` (array, optional)
    First element: path to Jet PU ID SF JSON (correctionlib).  

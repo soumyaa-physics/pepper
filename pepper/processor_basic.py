@@ -1093,24 +1093,61 @@ class ProcessorBasicPhysics(pepper.Processor):
             prefix="FatJetId",
         )
 
-    def apply_jet_veto_map(self, data):
-        """Apply jet veto map according to the recommendations here:
-        https://cms-jerc.web.cern.ch/Recommendations/#jet-veto-maps.
-        First, a loose nominal selection is made. Then, veto events if any
-        jet fulfills the loose selection criteria and lies in the jet veto
-        region."""
-        jets = data["Jet"]
-        jetid = data["JetIdTightLeptonVeto"]
+    def _apply_jet_veto_map_like(self, data, collection, id_field,
+                                 fac_field, veto_map_key, built_sentinel=None):
+        """Veto events with a loosely-selected jet in a jet-veto region.
+        Shared implementation for AK4 (``Jet``) and AK8 (``FatJet``).
+        The loose selection uses correction-folded pt, so this must run
+        before the corresponding build_*_column bakes the factor in."""
+        jets = data[collection]
+        if built_sentinel is not None and built_sentinel in ak.fields(jets):
+            # built_sentinel is a marker that the collection has already been
+            # built with the factor applied, so we should not apply it again.
+            # We don't have one for FatJet atm.
+            raise RuntimeError(
+                f"_apply_jet_veto_map_like expects the pre-build {collection} "
+                f"collection (factor would be applied twice). Run the veto cut "
+                f"before build of {collection}.")
+        jetid = data[id_field]
+        j_pt = jets.pt
+        if fac_field in ak.fields(data):
+            # Veto is applied after JES and JER:
+            # https://cms-jerc.web.cern.ch/ApplicationTutorial/#correction-order
+            # fac_field re-derives JES (+JUNC/JER for MC). When absent, the
+            # NanoAOD-level JES is already in jets.pt - fallback to that.
+            j_pt = j_pt * data[fac_field]
         nominal_selection_mask = (
-            (jets.pt > 15)
+            (j_pt > 15)
             & jetid
             & ((jets.chEmEF + jets.neEmEF) < 0.9)
         )
-        veto_map = self.config["jet_veto_map"]
+        veto_map = self.config[veto_map_key]
         veto_jets = veto_map(eta=jets.eta[nominal_selection_mask],
                              phi=jets.phi[nominal_selection_mask])
-        veto_event = ak.any(veto_jets, axis=1)
-        return ~veto_event
+        return ~ak.any(veto_jets, axis=1)
+
+    def apply_jet_veto_map(self, data):
+        """Apply the jet veto map to R=0.4 jets. See
+        https://cms-jerc.web.cern.ch/Recommendations/#jet-veto-maps."""
+        return self._apply_jet_veto_map_like(
+            data,
+            collection="Jet",
+            id_field="JetIdTightLeptonVeto",
+            fac_field="jetfac",
+            veto_map_key="jet_veto_map",
+            built_sentinel="pass_pu_id",  # pass_pu_id marks the collection as already built with the factor applied
+        )
+
+    def apply_fatjet_veto_map(self, data):
+        """Apply the jet veto map to R=0.8 jets."""
+        return self._apply_jet_veto_map_like(
+            data,
+            collection="FatJet",
+            id_field="FatJetIdTightLeptonVeto",
+            fac_field="fatjetfac",
+            veto_map_key="jet_veto_map",  # same eta-phi map
+            built_sentinel=None,  # no clean built marker on FatJet
+        )
 
     def _good_jet_like(self, data, collection, jet_key, pt_factor_name=None):
         """Apply some basic quality cuts to a jet-like collection."""

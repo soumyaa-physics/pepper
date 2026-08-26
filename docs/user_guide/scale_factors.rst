@@ -185,6 +185,7 @@ Jet Veto Maps
 Jet veto maps allow specific regions of the detector to be masked out by
 vetoing jets that fall within known problematic areas
 (see more `here <https://cms-jerc.web.cern.ch/Recommendations/#jet-veto-maps>`__).
+The same veto map will be used for both jets and fat jets so there is just one configuration option.
 They are configured via ``jet_veto_map``, an optional array of arrays.
 Each inner array contains two elements:
 
