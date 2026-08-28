@@ -1,3 +1,5 @@
+.. _scripts:
+
 Main Scripts
 ============
 
@@ -36,6 +38,10 @@ The ``scripts`` directory contains helper scripts to obtain inputs and produce o
 
 - ``hdf5_to_ttree.py``  
   Merge and convert Pepper HDF5 files to ROOT files containing TTrees.
+
+- ``json_to_toml.py``  
+  Convert between JSON and TOML files.
+  Direction is auto-detected from the input file's extension (``.json`` or ``.toml``).
 
 - ``merge_hists.py``  
   Compute weighted average of two scale-factor histograms.
