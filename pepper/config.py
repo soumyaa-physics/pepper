@@ -9,7 +9,6 @@ import re
 import pepper
 from pepper import HistDefinition
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -99,8 +98,20 @@ class Config(MutableMapping):
     def _load_config(self, path, prev_imports=None):
         if prev_imports is None:
             prev_imports = set()
-        with open(path) as f:
-            conf = self._textparser(f)
+        if ".toml" in path:
+            try:
+                import tomli
+            except ImportError:
+                logger.error(
+                    "The 'tomli' module is not installed."
+                    "Please install it to read .toml config files."
+                    )
+                raise
+            with open(path, "rb") as f:
+                conf = tomli.load(f)
+        else:
+            with open(path) as f:
+                conf = self._textparser(f)
         if "import" in conf:
             import_path = os.path.realpath(conf["import"])
             if import_path in prev_imports:

@@ -126,6 +126,25 @@ test:2024_chunksize_0:
     TESTNAME: "2024"
     TEST_EXTRA_ARGS: "--chunksize 0"
 
+test:ul18_toml:
+  extends: .test_template
+  needs:
+    - job: setup:default
+      artifacts: true
+  before_script:
+    - source environment.sh
+    - python3 -m pip install --upgrade hjson tomli-w > /dev/null
+    - python3 scripts/json_to_toml.py configs/test_config_ul18.json configs/test_config_ul18.toml
+  script:
+    - source environment.sh
+    - bash test/run_test.sh ${TESTNAME} toml # The run_test.sh has a ".json" hardcoded,
+                                             # so I had to modify it to allow .toml
+  variables:
+    TESTNAME: "ul18"
+  rules:
+    - when: always
+      allow_failure: true
+
 build-docs:
   stage: build-docs
   tags:

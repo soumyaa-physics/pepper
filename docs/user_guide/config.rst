@@ -1,7 +1,12 @@
 .. _configuration-reference:
 
 Pepper Configuration
-====================
+========================================
+
+--------------------
+About the config file
+--------------------
+
 
 Pepper uses a JSON-based configuration format. JSON arrays map to Python
 lists, and JSON objects map to Python dictionaries with string keys.
@@ -22,6 +27,29 @@ Masses and transverse momenta (``pT``) are always interpreted in **GeV**.
 The following sections describe the available configuration options. Each of the 
 options corresponds to a key in the JSON configuration file. Options marked as
 *optional* may be omitted.
+
+
+[Optional] Using ``.toml`` config files
+^^^^^^^^^^^^^^
+
+
+Besides ``JSON``, you can also use ``TOML`` (see https://toml.io/) to make your config file. 
+Similiar with ``HJSON``, it also allows some features that tends to be easier to read,
+specially when developing in Python-based environments. Since version 3.11, ``tomllib``
+is a `Python standard library <https://peps.python.org/pep-0680/>`__. 
+
+You can convert from ``.json`` to ``.toml`` config files (and vice versa) using 
+the ``json_to_toml.py`` script inside the ``scripts`` folder (see :ref:`scripts`).
+
+Example of usage:
+
+.. code-block:: bash
+
+    python json_to_toml.py config.json           # -> config.toml
+    python json_to_toml.py config.toml           # -> config.json
+    python json_to_toml.py config.json out.toml  # custom output path
+
+
 
 
 .. _special-variables:
