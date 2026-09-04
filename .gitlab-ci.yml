@@ -133,17 +133,13 @@ test:ul18_toml:
       artifacts: true
   before_script:
     - source environment.sh
-    - python3 -m pip install --upgrade hjson tomli-w > /dev/null
-    - python3 scripts/json_to_toml.py configs/test_config_ul18.json configs/test_config_ul18.toml
+    - python3 -m pip install --upgrade hjson tomli-w
+    - python3 scripts/json_to_toml.py test/configs/test_config_ul18.json test/configs/test_config_ul18.toml
   script:
     - source environment.sh
-    - bash test/run_test.sh ${TESTNAME} toml # The run_test.sh has a ".json" hardcoded,
-                                             # so I had to modify it to allow .toml
+    - bash test/run_test.sh ${TESTNAME} toml
   variables:
     TESTNAME: "ul18"
-  rules:
-    - when: always
-      allow_failure: true
 
 build-docs:
   stage: build-docs
