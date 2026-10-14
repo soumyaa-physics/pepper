@@ -21,6 +21,7 @@ pepper.egg-info
 
 #environment
 my_pepperenv
+environment.sh.bak
 
 # sphinx build folder
 docs/_build
