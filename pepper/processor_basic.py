@@ -501,10 +501,10 @@ class ProcessorBasicPhysics(pepper.Processor):
     def mpv_quality(self, data):
         """Check quality of primary vertex."""
         # Does not include check for fake. Is this even needed?
-        R = np.hypot(data["PV_x"], data["PV_y"])
-        return ((data["PV_chi2"] != 0)
-                & (data["PV_ndof"] > 4)
-                & (abs(data["PV_z"]) <= 24)
+        R = np.hypot(data["PV"]["x"], data["PV"]["y"])
+        return ((data["PV"]["chi2"] != 0)
+                & (data["PV"]["ndof"] > 4)
+                & (abs(data["PV"]["z"]) <= 24)
                 & (R <= 2))
 
     def met_filters(self, is_mc, data):
