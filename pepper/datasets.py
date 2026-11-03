@@ -40,12 +40,12 @@ def dataset_to_lfn_local(dataset, store, ext=".root"):
     elif tier.startswith("NANOAOD"):
         campaign, version = processed.split("-", 1)
         datatype = "mc" if tier.endswith("SIM") else "data"
-        pat = "{}/{}/{}/{}/{}/{}/*/*{}".format(
+        pat = "{}/{}/{}/{}/{}/{}/**/*{}".format(
             store, datatype, campaign, primary, tier, version, ext)
     else:
         raise ValueError("Unknown tier in dataset, must be NANOAOD, "
                          f"NANOAODSIM or USER: {dataset}")
-    return set(["/store/" + os.path.relpath(p, store) for p in glob(pat)])
+    return set(["/store/" + os.path.relpath(p, store) for p in glob(pat, recursive=True)])
 
 
 def lfn_to_local_path(lfn, store):
