@@ -1,0 +1,12 @@
+{
+    "met": {
+        "bins": [{"name": "met", "label": "MET", "n_or_arr": 20,
+                  "lo": 0, "hi": 200, "unit": "GeV"}],
+        "fill": {"met": ["MET", "pt"]}
+    },
+    "mu_pt": {
+        "bins": [{"name": "pt", "label": "pt", "n_or_arr": 20,
+                  "lo": 0, "hi": 200}],
+        "fill": {"pt": ["Muon", "pt"]}
+    }
+}
