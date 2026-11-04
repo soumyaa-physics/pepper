@@ -978,7 +978,7 @@ class ProcessorBasicPhysics(pepper.Processor):
                         raise ValueError("variation must be one of 'central', 'up' or 'down'")
                 else:
                     jersf = self.config["jme_correctionlib_corrections"]["jet_ressf"](
-                        JetPt=pt, JetEta=eta, Rho=rho, systematic=variation)
+                        JetPt=pt, JetEta=eta, Rho=rho, variation=variation)
             else:
                 jer = self.config["jet_resolution"](
                     JetPt=pt, JetEta=eta, Rho=rho)
@@ -997,7 +997,7 @@ class ProcessorBasicPhysics(pepper.Processor):
                 jer = self.config["fatjet_jme_correctionlib_corrections"]["jet_resolution"](
                         JetPt=pt, JetEta=eta, Rho=rho)
                 jersf = self.config["fatjet_jme_correctionlib_corrections"]["jet_ressf"](
-                        JetPt=pt, JetEta=eta, Rho=rho, systematic=variation)
+                        JetPt=pt, JetEta=eta, Rho=rho, variation=variation)
             else:
                 raise ValueError("FatJet JER requires 'fatjet_jme_correctionlib_corrections'!")
         jersmear = jer * rng.normal(size=len(jer))

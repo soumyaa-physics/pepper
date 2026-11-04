@@ -46,7 +46,7 @@ setup:default:
       artifacts: true
   script:
     - source environment.sh
-    - bash test/run_test.sh ${TESTNAME}
+    - bash tests/integration/run_test.sh ${TESTNAME}
   rules:
     - when: always
   artifacts:
@@ -107,7 +107,7 @@ test:ul18_xrootd:
     - export X509_USER_PROXY=$(pwd)/myproxy
     - export X509_CERT_DIR=/cvmfs/grid.cern.ch/etc/grid-security/certificates/
     - voms-proxy-info # to test it
-    - bash test/run_test.sh ${TESTNAME}
+    - bash tests/integration/run_test.sh ${TESTNAME}
   variables:
     TESTNAME: "ul18_xrootd"
     TEST_EXTRA_ARGS: "--debug"
@@ -134,12 +134,45 @@ test:ul18_toml:
   before_script:
     - source environment.sh
     - python3 -m pip install --upgrade hjson tomli-w
-    - python3 scripts/json_to_toml.py test/configs/test_config_ul18.json test/configs/test_config_ul18.toml
+    - python3 scripts/json_to_toml.py tests/integration/configs/test_config_ul18.json tests/integration/configs/test_config_ul18.toml
   script:
     - source environment.sh
-    - bash test/run_test.sh ${TESTNAME} toml
+    - bash tests/integration/run_test.sh ${TESTNAME} toml
   variables:
     TESTNAME: "ul18"
+
+.unit_template:
+  extends: .test_template
+  before_script:
+    - source environment.sh
+    - python3 -m pip install tomli tomli-w > /dev/null  # pytest from LCG; pytest 9 breaks its plugins
+  artifacts:
+    when: always
+    expire_in: 1 week
+    reports:
+      junit: report.xml
+
+test:unit:
+  extends: .unit_template
+  script:
+    - source environment.sh
+    - python3 -m pytest tests/unit -p no:ctest_measurements_reporter -m "not needs_grid" --junitxml=report.xml
+
+test:unit_grid:
+  extends: .unit_template
+  id_tokens:
+    MY_JOB_JWT:
+        aud: "cms-cat-grid-proxy-service.app.cern.ch"
+  script:
+    - 'proxy=$(curl -H "Authorization: ${MY_JOB_JWT}" "https://cms-cat-grid-proxy-service.app.cern.ch/api" | tr -d \")'
+    - source environment.sh
+    - printf $proxy | base64 -d > myproxy
+    - export X509_USER_PROXY=$(pwd)/myproxy
+    - export X509_CERT_DIR=/cvmfs/grid.cern.ch/etc/grid-security/certificates/
+    - python3 -m pytest tests/unit -p no:ctest_measurements_reporter -m needs_grid --junitxml=report.xml
+  rules:
+    - when: always
+      allow_failure: true # since it doesnt work on forks that are not under cms-analysis
 
 build-docs:
   stage: build-docs
