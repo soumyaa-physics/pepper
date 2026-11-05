@@ -638,9 +638,13 @@ class Processor(coffea.processor.ProcessorABC):
         cats_present = set()
         for dataset, hist in histdict.items():
             cats_present |= hist_col.get_cats_present(hist)
+            if ("bdt_score" in [ax.name for ax in hist.axes] and len(hist.axes["bdt_score"]) == 2000):
+                import hist as hi
+                hist = hist[{"bdt_score": slice(None, None, hi.rebin(10))}]
             if hist_sum is None:
                 hist_sum = hist.copy()
             else:
+                
                 hist_sum += hist
         cutnum = cuts.index(key[0])
         if format == "root":

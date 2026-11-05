@@ -417,20 +417,56 @@ class ProcessorBasicPhysics(pepper.Processor):
                     return era
             raise ValueError(f"Run {run} does not correspond to any era")
 
+    # def passing_trigger(self, pos_triggers, neg_triggers, data):
+    #     """Return mask for events that pass the trigger."""
+    #     hlt = data["HLT"]
+    #     available = ak.fields(hlt)
+    #     triggered = np.full(len(data), False)
+    #     for trigger_path in pos_triggers:
+    #         if trigger_path not in available:
+    #             logger.debug(f"HLT_{trigger_path} not in file")
+    #             continue
+    #         triggered |= np.asarray(hlt[trigger_path])
+    #     for trigger_path in neg_triggers:
+    #         if trigger_path not in available:
+    #             continue
+    #         triggered &= ~np.asarray(hlt[trigger_path])
+    #     return triggered
+
     def passing_trigger(self, pos_triggers, neg_triggers, data):
-        """Return mask for events that pass the trigger."""
+        """Return mask for events that pass at least one trigger."""
         hlt = data["HLT"]
         available = ak.fields(hlt)
-        triggered = np.full(len(data), False)
+
+        triggered = np.zeros(len(data), dtype=bool)
+
         for trigger_path in pos_triggers:
             if trigger_path not in available:
-                logger.debug(f"HLT_{trigger_path} not in file")
+                logger.warning(
+                    f"Trigger {trigger_path} is NOT available in this file"
+                )
                 continue
-            triggered |= np.asarray(hlt[trigger_path])
+
+            fired = np.asarray(hlt[trigger_path], dtype=bool)
+
+            logger.info(
+                f"Trigger {trigger_path}: "
+                f"{np.count_nonzero(fired)} / {len(fired)} events pass"
+            )
+
+            triggered |= fired
+
+        logger.info(
+            f"Combined trigger OR: "
+            f"{np.count_nonzero(triggered)} / {len(data)} events pass"
+        )
+
         for trigger_path in neg_triggers:
             if trigger_path not in available:
                 continue
-            triggered &= ~np.asarray(hlt[trigger_path])
+
+            triggered &= ~np.asarray(hlt[trigger_path], dtype=bool)
+
         return triggered
 
     def add_l1_prefiring_weights(self, data):

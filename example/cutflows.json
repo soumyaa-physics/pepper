@@ -1,0 +1,70 @@
+{
+    "TTTo2L2Nu_TuneCP5_13TeV-powheg-pythia8": {
+        "all": {
+            "BeforeCuts": 932144.2780914307,
+            "Trigger": 615023.3249816895,
+            "Exactly2Leptons": 209939.62049865723,
+            "OCLeptons": 207177.0849761963
+        }
+    },
+    "TTToSemiLeptonic_TuneCP5_13TeV-powheg-pythia8": {
+        "all": {
+            "BeforeCuts": 3761633.341217041,
+            "Trigger": 1457881.0417480469,
+            "Exactly2Leptons": 12125.219360351562,
+            "OCLeptons": 7274.52490234375
+        }
+    },
+    "DYJetsToLL_M-50_TuneCP5_13TeV-madgraphMLM-pythia8": {
+        "all": {
+            "BeforeCuts": 13841.11010080576,
+            "Trigger": 5619.590100347996,
+            "Exactly2Leptons": 3008.8200001716614,
+            "OCLeptons": 3001.8200001716614
+        }
+    },
+    "DYJetsToLL_M-10to50_TuneCP5_13TeV-madgraphMLM-pythia8": {
+        "all": {
+            "BeforeCuts": 18737.650000333786,
+            "Trigger": 191.99000000953674,
+            "Exactly2Leptons": 29.0,
+            "OCLeptons": 29.0
+        }
+    },
+    "EGamma": {
+        "all": {
+            "BeforeCuts": 18038.0,
+            "Lumi": 18038.0,
+            "Trigger": 11999.0,
+            "Exactly2Leptons": 362.0,
+            "OCLeptons": 356.0
+        }
+    },
+    "DoubleMuon": {
+        "all": {
+            "BeforeCuts": 330842.0,
+            "Lumi": 330724.0,
+            "Trigger": 137264.0,
+            "Exactly2Leptons": 42510.0,
+            "OCLeptons": 42408.0
+        }
+    },
+    "SingleMuon": {
+        "all": {
+            "BeforeCuts": 293539.0,
+            "Lumi": 293539.0,
+            "Trigger": 231774.0,
+            "Exactly2Leptons": 1910.0,
+            "OCLeptons": 1902.0
+        }
+    },
+    "MuonEG": {
+        "all": {
+            "BeforeCuts": 153318.0,
+            "Lumi": 145582.0,
+            "Trigger": 66757.0,
+            "Exactly2Leptons": 1573.0,
+            "OCLeptons": 1426.0
+        }
+    }
+}

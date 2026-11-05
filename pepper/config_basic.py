@@ -5,7 +5,7 @@ import hjson
 import coffea
 from coffea import lookup_tools
 from functools import partial
-
+import correctionlib
 import pepper
 from pepper.scale_factors import (
     TopPtWeigter,
@@ -103,8 +103,10 @@ class ConfigBasicPhysics(pepper.Config):
         return TopPtWeigter(**value)
 
     def _get_pileup_reweighting(self, value):
-        with uproot.open(self._get_path(value)) as f:
-            weighter = PileupWeighter(f)
+        # with uproot.open(self._get_path(value)) as f:
+        #     weighter = PileupWeighter(f)
+        path = self._get_path(value)
+        weighter = correctionlib.CorrectionSet.from_file(path)
         return weighter
 
     def _get_btag_sf(self, value):
