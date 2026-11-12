@@ -8,6 +8,7 @@ import urllib.request
 import ssl
 import json
 
+import pepper.misc
 
 logger = logging.getLogger(__name__)
 __cernrootcert = None
@@ -39,12 +40,12 @@ def dataset_to_lfn_local(dataset, store, ext=".root"):
     elif tier.startswith("NANOAOD"):
         campaign, version = processed.split("-", 1)
         datatype = "mc" if tier.endswith("SIM") else "data"
-        pat = "{}/{}/{}/{}/{}/{}/*/*{}".format(
+        pat = "{}/{}/{}/{}/{}/{}/**/*{}".format(
             store, datatype, campaign, primary, tier, version, ext)
     else:
         raise ValueError("Unknown tier in dataset, must be NANOAOD, "
                          f"NANOAODSIM or USER: {dataset}")
-    return set(["/store/" + os.path.relpath(p, store) for p in glob(pat)])
+    return set(["/store/" + os.path.relpath(p, store) for p in glob(pat, recursive=True)])
 
 
 def lfn_to_local_path(lfn, store):
@@ -91,11 +92,12 @@ def dataset_to_lfn_dbs(dataset):
     proxy certificate file isn't at its usual location (/tmp/x509up_uNNN), it
     can be set via the environment variable X509_USER_PROXY."""
 
-    DBSURL = "https://cmsweb.cern.ch/dbs/prod/global/DBSReader/files?dataset="
+    DBSURL = "https://cmsweb.cern.ch/dbs/prod/global/DBSReader/files"
+    dbsurl_dataset = f"{DBSURL}?dataset={dataset}&validFileOnly=1"
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.load_verify_locations(**_get_cernca_rootcert())
     context.load_cert_chain(**_get_cert_vomsproxy())
-    with urllib.request.urlopen(DBSURL + dataset, context=context) as f:
+    with urllib.request.urlopen(dbsurl_dataset, context=context) as f:
         dbs_reply = f.read()
     dbs_files = json.loads(dbs_reply.decode())
     return set([file["logical_file_name"] for file in dbs_files])
@@ -106,8 +108,11 @@ def lfn_to_xrootd_path(lfn, xrootddomain):
     return f"root://{xrootddomain}/" + lfn
 
 
-def resolve_lfn(lfn, store=None, xrootddomain=None):
-    """Get paths and URLs for a file given a specific logical file name (LFN).
+def locate_lfn(lfn, store=None, xrootddomain=None, use_eos_redirector=True):
+    """Get all known paths and URLs for a logical file name (LFN), without
+    ``url_priority``/``url_blacklist`` reordering/filtering (see
+    ``apply_url_priority_and_blacklist``) - local path first if present,
+    then XRootD locations in ``locate()`` order.
 
     Parameters
     ----------
@@ -118,6 +123,9 @@ def resolve_lfn(lfn, store=None, xrootddomain=None):
         See ``expand_datasetdict``
     xrootddomain
         See ``expand_datasetdict``
+    use_eos_redirector
+        If True and the file is located on EOS, the EOS redirector URL will
+        be used instead of the direct EOS path.
 
     Returns
     -------
@@ -128,7 +136,9 @@ def resolve_lfn(lfn, store=None, xrootddomain=None):
         lfn = lfn.split("cmslfn:/", 1)[1]
     if store is not None:
         path = lfn_to_local_path(lfn, store)
-        if os.path.exists(path):
+        if use_eos_redirector and os.path.exists(path):
+            if path.startswith("/eos/"):
+                path = pepper.misc.eos_path_to_url(path)
             pfns.append(path)
     if xrootddomain is not None:
         import XRootD.client
@@ -143,6 +153,80 @@ def resolve_lfn(lfn, store=None, xrootddomain=None):
         domains = [r.address for r in loc]
         pfns.extend(f"root://{d}/{lfn}" for d in domains)
     return pfns
+
+
+def apply_url_priority_and_blacklist(pfns, url_blacklist=None, url_priority=None):
+    """Reorder and filter the XRootD URLs in a list of paths/URLs as
+    returned by ``locate_lfn``, according to ``url_priority``/
+    ``url_blacklist``. Local paths (i.e. not starting with "root://") are
+    left untouched and stay first.
+
+    Parameters
+    ----------
+    pfns
+        List of paths/URLs, as returned by ``locate_lfn``
+    url_blacklist
+        Optional; a blacklist of XRootD URLs which should not be used for
+        resolving the file
+    url_priority
+        Optional; a list of strings. If given, XRootD URLs containing any of
+        these strings will be preferred over other URLs for the same file.
+
+    Returns
+    -------
+        Reordered and filtered list of paths/URLs.
+    """
+    local = [p for p in pfns if not p.startswith("root://")]
+    domains = [p for p in pfns if p.startswith("root://")]
+    if url_priority is not None:
+        domains_sorted = []
+        for url in url_priority:
+            for d in domains:
+                if url in d and d not in domains_sorted:
+                    domains_sorted.append(d)
+        domains_sorted.extend(d for d in domains if d not in domains_sorted)
+        domains = domains_sorted
+    if url_blacklist is not None:
+        domains_before = domains
+        domains = [d for d in domains if not any(
+                blacklisted in d for blacklisted in url_blacklist)]
+        if len(domains_before) > 0 and len(domains) == 0:
+            raise ValueError("All XRootD URLs are on the blacklist for: "
+                             + ", ".join(domains_before))
+    return local + domains
+
+
+def resolve_lfn(lfn, store=None, xrootddomain=None, url_blacklist=None,
+                use_eos_redirector=True, url_priority=None):
+    """Get paths and URLs for a file given a specific logical file name (LFN).
+    Equivalent to calling ``locate_lfn`` followed by
+    ``apply_url_priority_and_blacklist``.
+
+    Parameters
+    ----------
+    lfn
+        Logical file name of the file, normally starts with "/store/". This
+        function ccepts the additional prefix "cmslfn://store/".
+    store
+        See ``expand_datasetdict``
+    xrootddomain
+        See ``expand_datasetdict``
+    url_blacklist
+        Optional; a blacklist of XRootD URLs which should not be used for
+        resolving the file
+    use_eos_redirector
+        If True and the file is located on EOS, the EOS redirector URL will
+        be used instead of the direct EOS path.
+    url_priority
+        Optional; a list of strings. If given, XRootD URLs containing any of
+        these strings will be preferred over other URLs for the same file.
+
+    Returns
+    -------
+        List of valid paths and URLs for the given logical file name.
+    """
+    pfns = locate_lfn(lfn, store, xrootddomain, use_eos_redirector)
+    return apply_url_priority_and_blacklist(pfns, url_blacklist, url_priority)
 
 
 def dataset_to_lfns(dataset, store=None, ext=".root", mode="local"):
@@ -177,7 +261,8 @@ def dataset_to_lfns(dataset, store=None, ext=".root", mode="local"):
     return lfns
 
 
-def read_paths(source, store=None, ext=".root", mode="local"):
+def read_paths(source, store=None, ext=".root", mode="local",
+               use_eos_redirector=True):
     """Get all file names of a dataset, which can be interpreted from a
     source
 
@@ -193,6 +278,8 @@ def read_paths(source, store=None, ext=".root", mode="local"):
         See ``expand_datasetdict``
     mode
         See ``expand_datasetdict``
+    use_eos_redirector
+        See ``resolve_lfn``
 
     Returns
     -------
@@ -201,6 +288,12 @@ def read_paths(source, store=None, ext=".root", mode="local"):
     paths = []
     if source.endswith(ext):
         paths = glob(source)
+        if use_eos_redirector:
+            paths = [
+                pepper.misc.eos_path_to_url(p)
+                if p.startswith("/eos/") else p
+                for p in paths
+            ]
     elif (source.count("/") == 3
             and (source.endswith("NANOAOD")
                  or source.endswith("NANOAODSIM")
@@ -227,7 +320,7 @@ def read_paths(source, store=None, ext=".root", mode="local"):
 
 
 def expand_datasetdict(datasets, store=None, ignore_path=None, ext=".root",
-                       mode="local"):
+                       mode="local", use_eos_redirector=True):
     """Interpred a dict of dataset names or paths
 
     Parameters
@@ -250,6 +343,9 @@ def expand_datasetdict(datasets, store=None, ignore_path=None, ext=".root",
         to xrootd URLs. If 'local+xrootd' only files that are not present
         locally are returned with an xrootd URL, otherwise local file paths
         are returned.
+    use_eos_redirector
+        If True and the file is located on EOS, the EOS redirector URL will
+        be used instead of the direct EOS path.
 
     Returns
     -------
@@ -262,7 +358,7 @@ def expand_datasetdict(datasets, store=None, ignore_path=None, ext=".root",
     for key in datasets.keys():
         paths = list(dict.fromkeys([
             a for b in datasets[key] for a in read_paths(
-                b, store, ext, mode)]))
+                b, store, ext, mode, use_eos_redirector)]))
         if ignore_path:
             processed_paths = []
             for path in paths:

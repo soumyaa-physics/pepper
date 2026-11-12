@@ -8,13 +8,19 @@ from functools import partial
 import awkward as ak
 import uproot
 from tqdm import tqdm
+import numpy as np
 
 import pepper
 import pepper.htcondor
 
 
-def get_counts(lfn, config, geskey, lhesskey, lhepdfskey):
+def get_counts(file_entry, config, geskey, lhesskey, lhepdfskey):
+    lfn, process_name = file_entry
     paths = config.get_paths_for_lfn(lfn)
+    norm_genwgt = (("norm_genweights" in config and
+                    config["norm_genweights"]) or
+                   ("genweights_to_norm" in config and
+                    process_name in config["genweights_to_norm"]))
     for path in paths:
         try:
             f = uproot.open(path, timeout=pepper.misc.XROOTDTIMEOUT)
@@ -26,7 +32,10 @@ def get_counts(lfn, config, geskey, lhesskey, lhepdfskey):
         raise OSError(f"Could not open any files for path {lfn}")
     with f:
         runs = f["Runs"]
-        gen_event_sumw = runs[geskey].array()[0]
+        if norm_genwgt:
+            gen_event_sumw = ak.sum(np.sign(f["Events"]["genWeight"]))
+        else:
+            gen_event_sumw = runs[geskey].array()[0]
         lhe_scale_sumw = runs[lhesskey].array()[0]
         lhe_pdf_sumw = ak.Array([])
         has_lhe = len(lhe_scale_sumw) != 0
@@ -128,7 +137,7 @@ if __name__ == "__main__":
     ) as cluster:
         cluster.set_global_config()
         for result in tqdm(cluster.process(
-                get_counts, datasets.keys()), total=len(datasets)):
+                get_counts, datasets.items()), total=len(datasets)):
             add_counts(counts, datasets, lhepdfskey, result)
 
     for key in counts.keys():

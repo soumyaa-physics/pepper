@@ -2,16 +2,9 @@ import hist as hi
 import awkward as ak
 import numpy as np
 from collections import defaultdict
+import functools
+import itertools
 
-flavour_map = {
-    "undef" : [0],
-    "light" : [1,2,3],
-    "heavy" : [4,5],
-    "ele" : [11],
-    "mu" : [13],
-    "tau" : [15],
-    "g" : [21],
-}
 
 def not_arr(arr):
     """Element wise logical not"""
@@ -48,32 +41,13 @@ def concatenate(*arr, axis=0):
     return ak.concatenate(arr_processed, axis=axis)
 
 
-def max_abs(data):
-    max_ = ak.argmax(np.abs(data), axis=1, keepdims=True, mask_identity=True)
-    max_ = max_[~ak.is_none(max_,axis=1)]
-    return data[max_]
-
-def num(data):
-    if len(data) == 0:
-        return ak.Array([])
+def to_int(num_or_arr):
+    if isinstance(num_or_arr, np.ndarray) or isinstance(num_or_arr, ak.Array):
+        return ak.values_astype(num_or_arr, "int")
     else:
-        return ak.num(data)
+        return int(num_or_arr)
 
-def pass_score(data, thr=None, return_obj=False):
-    if len(data) == 0:
-        return ak.Array([])
-    if return_obj:
-        return data[data.disTauTag_score1 >= thr]
-    else: # just return the mask (needed for categories)
-        return data.disTauTag_score1 >= thr
 
-def flav_any(data, n_jet, flav):
-    flav = flavour_map[flav]
-    jet = data[:, n_jet]
-    jet_pass = [jet == f for f in flav]
-    jet_pass = np.any(jet_pass, axis = 0)
-    return jet_pass
-        
 func_dict = {
     "sin": np.sin,
     "cos": np.cos,
@@ -89,6 +63,7 @@ func_dict = {
     "arctanh": np.arctanh,
     "exp": np.exp,
     "log": np.log,
+    "log10": np.log10,
     "sqrt": np.sqrt,
     "abs": np.abs,
     "sign": np.sign,
@@ -97,15 +72,13 @@ func_dict = {
     "equal": equal,
     "leaddiff": leaddiff,
     "concatenate": concatenate,
+    "int": to_int,
 
     "sum": lambda x: ak.sum(x, axis=1),
-    "num": num,
+    "num": ak.num,
     "zeros_like": ak.zeros_like,
     "ones_like": ak.ones_like,
     "full_like": ak.full_like,
-    "max_abs": max_abs,
-    "pass_score": pass_score,
-    "flav_any": flav_any
 }
 
 
@@ -125,7 +98,7 @@ class HistDefinition:
     categorizations (``StrCategory`` axes) on top of what is already in the
     definition."""
 
-    def __init__(self, config, compute_systematics):
+    def __init__(self, config):
         """
         Parameters
         ----------
@@ -177,10 +150,14 @@ class HistDefinition:
             self.weight = config["weight"]
         else:
             self.weight = None
-        if "systematics" in config and compute_systematics:
-            self.systematics = config["systematics"]
+        if "weight_factor" in config:
+            if "weight" in config:
+                raise HistDefinitionError(
+                    "The 'weight_factor' option cannot be used in "
+                    "conjuction with the 'weight' option")
+            self.weight_fac = config["weight_factor"]
         else:
-            self.systematics = None
+            self.weight_fac = None
         for axisname, method in config["fill"].items():
             if axisname in [b.name for b in bins]:
                 self.bin_fills[axisname] = method
@@ -198,33 +175,40 @@ class HistDefinition:
             self.step_requirement = config["step_requirement"]
         else:
             self.step_requirement = None
+        if "do_systs" in config:
+            self.do_systs = config["do_systs"]
+        else:
+            self.do_systs = True
+        if "selector_cats" in config:
+            self.sel_cats = config["selector_cats"]
+        else:
+            self.sel_cats = True
+        if "only_for_cats" in config:
+            self.only_for_cats = config["only_for_cats"]
+        else:
+            self.only_for_cats = None
+        self.blind_data = config.get("blind_data", False)
 
     @staticmethod
-    def _prepare_fills(fill_vals, mask=None):
+    def _prepare_fills(fill_vals):
         """Checks for length consistency across the fill_vals,
-        removes events where counts do not agree (in case of 2 dims), applies
-        the given mask and flattens everything into numpy arrays.
+        removes events where counts do not agree (in case of 2 dims)
+        and flattens everything into numpy arrays.
 
         Parameters
         ----------
         fill_vals
             Dict of awkward arrays, no more than 2 dimensions
-        mask
-            Remove values from the result for which this bool array is False
 
         Returns
         -------
         prepared
             Dict of the prepared values, which can be used to fill a Hist
         """
-        if mask is not None:
-            if mask.ndim == 1:
-                mask = ak.fill_none(mask, False)
-                # Raw numpy has better performance here
-                mask = np.asarray(mask)
-        size = None
+
+        size = len(next(iter(fill_vals.values())))
+        mask = np.full(size, True)  # Mask is purely 1D, i.e. event-level
         counts = None
-        jagged_example = None
         prepared = {}
         for key, data in fill_vals.items():
             if data is None:
@@ -232,35 +216,29 @@ class HistDefinition:
                 return {key: None}
             if data.ndim > 2:
                 raise ValueError(f"Got more than 2 dimensions for {key}")
-            if size is None:
-                size = len(data)
-            elif size != len(data):
+            if size != len(data):
                 raise ValueError(f"Got inconsistant filling size ({size} and"
                                  f"{len(data)} for {key})")
-            if mask is None:
-                mask = ak.Array(np.full(size, True))
             # Make sure all fills have the same mask originating from ak.mask
-            if data.ndim == 1:
-                # Performance
-                mask = mask & ~np.asarray(ak.is_none(data))
-            else:
-                mask = mask & ~ak.is_none(data)
+            mask = mask & ~np.asarray(ak.is_none(data))
+
             # Make sure all counts agree
             if data.ndim == 2:
+                # Apply ak.fill_none to catch mixed 1D-2D arrays where
+                # some entries are None at event level
+                num_data = np.asarray(ak.fill_none(ak.num(data), 0))
                 if counts is None:
-                    counts = ak.num(data)
-                    jagged_example = data
+                    counts = num_data
                 else:
-                    mask = mask & (counts == ak.num(data))
+                    mask = mask & (counts == num_data)
         for key, data in fill_vals.items():
-            if jagged_example is not None and data.ndim == 1:
-                data = ak.broadcast_arrays(
-                    data, ak.from_regular(jagged_example))[0]
-            prepared[key] = np.asarray(ak.flatten(data[mask], axis=None))
-        # Workaround for boost histogram not adding category bin when no events
-        if len(next(iter(prepared.values()))) == 0:
-            prepared = {key: 0 for key in prepared.keys()}
-            prepared["weight"] = 0
+            if counts is not None and data.ndim == 1:
+                # Manual broadcast using np.repeat instead of awkward
+                # for performance reasons
+                data = np.repeat(np.asarray(data[mask]), counts[mask])
+                prepared[key] = data
+            else:
+                prepared[key] = np.asarray(ak.flatten(data[mask], axis=None))
         return prepared
 
     def create_hist(self, categorizations, has_systematic=False):
@@ -315,43 +293,87 @@ class HistDefinition:
         is_mc
             Whether this is simulation
         weight
-            Event weight as array
+            Event weight as array or dict of arrays (for systematics)
         """
-        has_systematic = (self.systematics is not None or
-                          (self.weight is None and isinstance(weight, dict)))
+
+        has_systematic = self.do_systs and self.weight is None \
+            and isinstance(weight, dict)
+
+        if not isinstance(weight, dict):
+            weight = {None: weight}
+        elif not has_systematic:
+            if "nominal" in weight:
+                weight = {None: weight["nominal"]}
+            else:
+                raise HistFillError("Hist should not include systs, but "
+                                    "no nominal was found")
+
+        if isinstance(self.sel_cats, list):
+            categorizations = {k: v for k, v in categorizations.items()
+                               if k in self.sel_cats}
+        elif not isinstance(self.sel_cats, bool):
+            raise HistDefinitionError(
+                "selector_cats must be either a list or a boolean")
+        elif not self.sel_cats:
+            categorizations = {}
+
+        if self.only_for_cats is not None:
+            if not isinstance(self.only_for_cats, dict):
+                raise HistDefinitionError(
+                    "only_for_cats must be a dictionary")
+            categorizations = categorizations.copy()
+            for catname, catvals in self.only_for_cats.items():
+                if not isinstance(catvals, list):
+                    catvals = [catvals]
+                if catname not in categorizations:
+                    raise HistFillError(
+                        "Category {catname} required in histogram, but "
+                        "not set in selector")
+                if not all(v in categorizations[catname] for v in catvals):
+                    raise HistFillError(
+                        "Not all required values for category {catname} are "
+                        "set in the selector")
+                categorizations[catname] = set(catvals)
+
         hist = self.create_hist(categorizations, has_systematic)
 
+        # Get the fills for the axes from the event-level data
         fill_vals = {name: DataPicker(method)(data)
                      for name, method in self.bin_fills.items()}
+        # If any fills are None, we cannot fill the histogram
         if any(val is None for val in fill_vals.values()):
             none_keys = [k for k, v in fill_vals.items() if v is None]
             raise HistFillError(f"No fill for axes: {', '.join(none_keys)}")
 
+        # Option to give an explicit weight in the config
         if self.weight is not None:
-            weight = DataPicker(self.weight)(data)
-            if weight is None:
+            new_weight = DataPicker(self.weight)(data)
+            if new_weight is None:
                 raise HistFillError(
                     "Weight specified in hist config not available")
-        if not isinstance(weight, dict):
-            weight = {None: weight}
+            weight = {None: new_weight}
+        elif self.weight_fac is not None:
+            weight_fac = DataPicker(self.weight_fac)(data)
+            if weight_fac is None:
+                raise HistFillError(
+                    "Weight factor specified in hist config not available")
+            weight = {k: v * weight_fac for k, v in weight.items()}
 
-        if self.systematics is not None:
-            weight = {"nominal": weight[None]}
-            for name, sys in self.systematics.items():
-                sys_col = DataPicker(sys)(data)
-                if sys_col is not None:
-                    # weight[name] = sys_col * weight["nominal"]
-                    weight[name] = sys_col
-
+        # Add categories explicitly defined in the histogram config
+        # to those already present from the processor
         categorizations = {name: {cat: [cat] for cat in cats}
                            for name, cats in categorizations.items()}
         categorizations.update(self.cat_fills)
         cat_present = defaultdict(dict)
+
+        # Get the bitmask for the different categories
         for name, val in categorizations.items():
             for cat, method in val.items():
                 cat_present[name][cat] = DataPicker(method)(data)
         for name, val in cat_present.items():
             if any(mask is None for mask in val.values()):
+                # If any category is undefined in the data, try to
+                # fill everything in the default key for this category
                 ax = next(ax for ax in self.axes if ax.name == name)
                 if ax.default_key is None:
                     none_keys = [k for k, v in val.items() if v is None]
@@ -364,34 +386,88 @@ class HistDefinition:
             non_array_fills = {}
         else:
             non_array_fills = {"dataset": dsname}
-        for weightname, w in weight.items():
-            if weightname is not None:
-                non_array_fills["sys"] = weightname
-            if w is not None:
-                fill_vals["weight"] = w
-            if len(cat_present) == 0:
-                prepared = self._prepare_fills(fill_vals)
 
-                if all(val is not None for val in prepared.values()):
-                    hist.fill(**non_array_fills, **prepared)
-            else:
-                cat_combinations = None
-                for name, val in cat_present.items():
-                    if cat_combinations is None:
-                        cat_combinations = {((name, cat), ): mask
-                                            for cat, mask in val.items()}
+        # Add the weights to the fill_values to process
+        for weightname, w in weight.items():
+            if w is not None:
+                # Use names starting with '__weight' for the weights
+                # to not have overlap with the bin fills
+                wname = "__weight/" + weightname \
+                    if weightname is not None else "__weight"
+                fill_vals[wname] = ak.fill_none(w, 0.)
+
+        cat_keys = []
+        # Add the category bitmasks to the fill_values
+        # and get all present keys for each category
+        for cat_name, cat_dict in cat_present.items():
+            cat_keys.append(cat_dict.keys())
+            for cat_key, cat_mask in cat_dict.items():
+                cname = "__cat/" + cat_name + "/" + cat_key
+                fill_vals[cname] = cat_mask
+
+        # Actually do the processing & broadcasting, for fills, weights
+        # and category bitmasks at once
+        prepared = self._prepare_fills(fill_vals)
+        # Filter out the category bitmasks again
+        prepared_nocats = {k: v for k, v in prepared.items()
+                           if not k.startswith("__cat")}
+
+        # Only fill if there are no Nones
+        if all(v is not None for k, v in prepared_nocats.items()
+               if not k.startswith("__weight")):
+            # Iterate over all possible combinations of categories
+            for cat_combination in itertools.product(*cat_keys):
+                if len(cat_combination) == 0:
+                    # No categories - no masking required
+                    prepared_masked = prepared_nocats
+                    cat_fills = {}
+                else:
+                    # Make a dictionary for this combination to pass to
+                    # hist.fill() later
+                    cat_fills = dict(zip(cat_present.keys(), cat_combination))
+                    # Get the masks that define this particular combination
+                    prepared_masks = [
+                        prepared["__cat/" + cat_name + "/" + cat_key]
+                        for cat_name, cat_key in cat_fills.items()
+                        ]
+
+                    # Combine the masks into one with bitwise and
+                    comb_mask = functools.reduce(
+                        lambda a, b: a & b, prepared_masks)
+
+                    # Apply the bitmask to the fill values
+                    prepared_masked = {}
+                    for k, v in prepared_nocats.items():
+                        if v is not None:
+                            v = v[comb_mask]
+                        if v is not None and len(v) > 0:
+                            prepared_masked[k] = v
+                        else:
+                            # Workaround when there are no events:
+                            # put zero everywhere including weights
+                            # so that the histogram is filled anyway
+                            prepared_masked[k] = 0
+
+                # Filter out the weights again for the pass to hist.fill()
+                prepared_noweights = {k: v for k, v in prepared_masked.items()
+                                      if not k.startswith("__weight")}
+
+                # Iterate over all weights (i.e. systematics) to fill
+                for weightname, w in weight.items():
+                    if weightname is not None:
+                        non_array_fills["sys"] = weightname
+                    if w is not None:
+                        # Get the prepared and masked weight array
+                        wname = "__weight/" + weightname \
+                            if weightname is not None else "__weight"
+                        prepared_weight = prepared_masked[wname]
+                        if prepared_weight is not None:
+                            hist.fill(**non_array_fills, **prepared_noweights,
+                                      **cat_fills, weight=prepared_weight)
                     else:
-                        new_cc = {}
-                        for cat, mask in val.items():
-                            for key, _mask in cat_combinations.items():
-                                key += ((name, cat),)
-                                new_cc[key] = mask & _mask
-                        cat_combinations = new_cc
-                for combination, mask in cat_combinations.items():
-                    prepared = self._prepare_fills(fill_vals, mask)
-                    combination = {key: val for key, val in combination}
-                    if all(val is not None for val in prepared.values()):
-                        hist.fill(**non_array_fills, **combination, **prepared)
+                        # No weight array present - fill without weights
+                        hist.fill(**non_array_fills, **prepared_noweights,
+                                  **cat_fills)
 
         return hist
 
@@ -475,9 +551,9 @@ class DataPicker:
                 if data is None:
                     break
             elif isinstance(sel, list):
-                try:
+                if all(f in data.fields for f in sel):
                     data = data[sel]
-                except (ValueError, KeyError):
+                else:
                     try:
                         data_proc = {}
                         counts = None

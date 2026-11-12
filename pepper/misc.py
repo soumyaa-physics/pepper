@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import enum
 import os
 from glob import glob
 import inspect
@@ -5,11 +8,13 @@ import gc
 from itertools import product
 from functools import wraps, partial
 from concurrent.futures import ThreadPoolExecutor
-
 import numpy as np
 import awkward as ak
 import hist as hi
 
+import lz4.frame
+import cloudpickle
+import pickle
 
 """
 Attributes
@@ -20,7 +25,80 @@ XROOTDTIMEOUT
 """
 
 
-XROOTDTIMEOUT = 10  # 10 s, no need to bother with slow sites
+XROOTDTIMEOUT = 20  # seconds
+
+
+class LHCRun(enum.Enum):
+    Run2 = "Run 2"
+    Run3 = "Run 3"
+
+
+_RUNS = {
+        LHCRun.Run2: [
+            "2016",
+            "2017",
+            "2018",
+            "ul2016pre",
+            "ul2016post",
+            "ul2017",
+            "ul2018"
+        ],
+        LHCRun.Run3: [
+            "2022pre",
+            "2022post",
+            "2023pre",
+            "2023post",
+            "2024",
+            "2025",
+        ]
+    }
+
+
+def get_run_for_year(year: str) -> LHCRun:
+    """Get the run name for a given year.
+
+    Parameters
+    ----------
+    year
+        Year to get the run name for, e.g. "2018" or "2022pre"
+
+    Returns
+    -------
+    run_name
+        Run name literal, e.g. "Run2" or "Run3"
+    """
+    for run_name, years in _RUNS.items():
+        if year in years:
+            return run_name
+    raise NotImplementedError(f"Year {year} not recognized. "
+                              f"Contact the pepper developers to add it.")
+
+
+def get_years_for_run(run_name: str | LHCRun) -> list[str]:
+    """Get the years for a given run name.
+
+    Parameters
+    ----------
+    run_name
+        Run name literals, e.g. "Run2" or "Run3"
+
+    Returns
+    -------
+    years
+        List of years, e.g. ["2022pre", "2022post", "2023pre", "2023post"]
+    """
+    if type(run_name) is str:
+        try:
+            run_name = LHCRun[run_name]
+        except KeyError:
+            msg = f"Run name {run_name} not recognized. " \
+                  f"Contact the pepper developers to add it."
+            raise NotImplementedError(msg)
+    if run_name not in _RUNS:
+        msg = f"Run name {run_name} not recognized. " \
+              f"Contact the pepper developers to add it."
+        raise NotImplementedError(msg)
+    return _RUNS[run_name]
 
 
 def normalize_trigger_path(path):
@@ -50,7 +128,7 @@ def get_trigger_paths_for(dataset, is_mc, trigger_paths, trigger_order=None,
     trigger_order
         Datasets to define the order in which the triggers are applied.
     normalize
-        Whether to remove HLT_ from the beginning
+        Whether to remove ``HLT_`` from the beginning
     era
         If not None and if <name>_era, where name is any dataset name, is
         present in `trigger_paths`, it will be used over just <name>. This can
@@ -90,6 +168,27 @@ def get_trigger_paths_for(dataset, is_mc, trigger_paths, trigger_order=None,
         pos_triggers = [normalize_trigger_path(t) for t in pos_triggers]
         neg_triggers = [normalize_trigger_path(t) for t in neg_triggers]
     return pos_triggers, neg_triggers
+
+
+def get_lhe_scale_idxs(weight_len):
+    if weight_len == 44:
+        # See https://github.com/cms-nanoAOD/cmssw/issues/537
+        return [34, 5, 24, 15]
+    elif weight_len == 9:
+        # This appears to be the standard case for most data sets
+        return [7, 1, 5, 3]
+    elif weight_len == 8:
+        # Same as length 9, just missing the nominal weight at index 4
+        return [6, 1, 4, 3]
+    elif weight_len == 18:
+        # Two sets of scale varations. From the titles in NanoAOD
+        # the exact order is not clear. Assume the right one comes
+        # first.
+        return [14, 2, 10, 6]
+    else:
+        raise RuntimeError(
+            "Unexpected length of the norm for LHEScaleWeight: "
+            f"{weight_len}")
 
 
 def get_event_files(eventdir, eventext, datasets):
@@ -283,23 +382,28 @@ def onedimeval(func, *arrays, tonumpy=True, output_like=0):
     counts_all_arrays = []
     flattened_arrays = []
     for array in arrays:
-        flattened = array
-        counts = []
-        for i in range(flattened.ndim - 1):
-            if isinstance(flattened.type.type, ak.types.RegularType):
-                counts.append(flattened.type.type.size)
-            else:
+        if isinstance(array, str):
+            flattened_arrays.append(array)
+            counts_all_arrays.append(0)
+        else:
+            flattened = array
+            counts = []
+            for i in range(flattened.ndim - 1):
                 counts.append(ak.num(flattened))
-            flattened = ak.flatten(flattened)
-        if tonumpy:
-            flattened = np.asarray(flattened)
-        counts_all_arrays.append(counts)
-        flattened_arrays.append(flattened)
+                flattened = ak.flatten(flattened)
+            if tonumpy:
+                flattened = np.asarray(flattened)
+            counts_all_arrays.append(counts)
+            flattened_arrays.append(flattened)
     res = func(*flattened_arrays)
     for count in reversed(counts_all_arrays[output_like]):
         res = ak.unflatten(res, count)
     for name, val in ak.parameters(arrays[output_like]).items():
         res = ak.with_parameter(res, name, val)
+    if isinstance(res, np.ndarray):
+        # Convert any remaining regular numpy arrays to awkward
+        # so they can get behaviours
+        res = ak.Array(res)
     res.behavior = arrays[output_like].behavior
     return res
 
@@ -330,66 +434,54 @@ def akremask(array, mask):
     return ak.mask(array[offsets], mask)
 
 
-class VirtualArrayCopier:
-    """Create a shallow copy of the an awkward Record Array such as NanoEvents
-    while trying to not make virtual subarrays load their contents.
+def eos_path_to_url(path):
+    """Convert an EOS path to a XRootD URL
 
-    Setting fields in record arrays containing virtual arrays often leads to
-    the virtual arrays to be loaded, which should be avoided. The class makes
-    it possible to achieve this.
+    Parameters
+    ----------
+    path
+        EOS path, e.g. /eos/cms/store/...
 
-    Notes
-    -----
-        With the removal of Virtual Arrays in Awkward version 2, this class
-        will also lose its function.
+    Returns
+    -------
+    url
+        XRootD URL, e.g. root://eoscms.cern.ch//store/...
     """
-    def __init__(self, array, attrs=[]):
-        """
-        Parameters
-        ----------
-        array
-            Record array containing virtual arrays that should not be touched
-        attrs
-            Attributes of the array to keep
-        """
-        self.data = {f: array[f] for f in ak.fields(array)}
-        self.behavior = array.behavior
-        self.attrs = {attr: getattr(array, attr) for attr in attrs}
-
-    def __setitem__(self, key, value):
-        """Add a field to the array"""
-        self.data[key] = value
-
-    def __getitem__(self, key):
-        """Get a field from the array"""
-        return self.data[key]
-
-    def __delitem__(self, key):
-        """Remove a field from the array"""
-        del self.data[key]
-
-    def get(self):
-        """Get an awkward Array version of the copy"""
-        array = ak.Array(self.data)
-        array.behavior = self.behavior
-        for attr, value in self.attrs.items():
-            setattr(array, attr, value)
-        return array
-
-    def wrap_with_copy(self, func):
-        """A decorator that will bind the result from ``get()`` to the first
-        parameter of the function"""
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            return func(self.get(), *args, **kwargs)
-        return wrapper
+    if path.startswith("/eos/user"):
+        return "root://eosuser.cern.ch/" + path
+    elif path.startswith("/eos/home-"):
+        return path.replace("/eos/home-", "root://eosuser.cern.ch//eos/user/")
+    elif path.startswith("/eos/cms/store/cmst3"):
+        return path.replace("/eos/cms/store",
+                            "root://eoscms.cern.ch//store/group")
+    elif path.startswith("/eos/cms/store"):
+        return path.replace("/eos/cms/store", "root://eoscms.cern.ch//store")
+    else:
+        raise ValueError(f"Unknown eos path: {path}")
 
 
 def akismasked(arr):
     """Return ``True`` if arr is masked on any axis"""
-    t = arr
-    while hasattr(t, "type"):
-        if isinstance(t.type, ak.types.OptionType):
+    t = arr.type
+    while hasattr(t, "content"):
+        if isinstance(t.content, ak.types.OptionType):
             return True
-        t = t.type
+        t = t.content
     return False
+
+
+def save(output, filename):
+    """Save a coffea object or collection thereof to disk
+    This is a more performant and memory-efficient replacement for
+    'coffea.util.save'.
+
+    This function can accept any picklable object.
+    Suggested suffix: ``.coffea``
+    """
+    with lz4.frame.open(filename, "wb") as fout:
+        p = cloudpickle.Pickler(fout, protocol=pickle.HIGHEST_PROTOCOL)
+        # Fast mode can have issues with recursive objects.
+        # See https://docs.python.org/3/library/pickle.html
+        # It does not seem to be an issue with the objects we are pickling.
+        p.fast = True
+        p.dump(output)

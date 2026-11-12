@@ -53,7 +53,8 @@ class OutputFiller:
         Dict holding all the cutflows and histograms filled by the filler
     """
     def __init__(self, hist_dict, is_mc, dsname, dsname_in_hist, sys_enabled,
-                 sys_overwrite=None, cuts_to_histogram=None):
+                 sys_overwrite=None, cuts_to_histogram=None,
+                 systs_to_histogram=None):
         """
         Parameters
         ----------
@@ -81,10 +82,14 @@ class OutputFiller:
         cuts_to_histogram
             Lists cuts for which histograms should be produced. If ``None``
             all cuts will create histograms
+        systs_to_histogram
+            Lists systematics which should be included in histograms.
+            If ``None``, all systematics will be included.
         """
         self.output = {
-            "hists": {},
-            "cutflows": defaultdict(AddableDict)
+            "hists": {dsname: {}},
+            "cutflows": defaultdict(AddableDict),
+            "gen_sumws": defaultdict(AddableDict)
         }
         if hist_dict is None:
             self.hist_dict = {}
@@ -96,7 +101,35 @@ class OutputFiller:
         self.sys_enabled = sys_enabled
         self.sys_overwrite = sys_overwrite
         self.cuts_to_histogram = cuts_to_histogram
+        self.systs_to_histogram = systs_to_histogram
         self.done_hists = set()
+
+    def fill_gen_sumws(self, weight):
+        """Fill an accumulator with the initial sum genweights for
+        lumifactor computations at the end of the run
+
+        Parameters
+        ----------
+        weight
+            An array of event weights
+        """
+        accumulator = self.output["gen_sumws"][self.dsname]
+        accumulator["gen_sumw"] = ak.sum(weight)
+
+    def add_sumws_for_norm(self, sys, names):
+        """Fill an accumulator with the sum of weights for systematic
+        variations which should be normalised at the end of the run
+
+        Parameters
+        ----------
+        systematics
+            Record array with systematic weights
+        names
+            The names of the systematics which should be normalised
+        """
+        accumulator = self.output["gen_sumws"][self.dsname]
+        for name in names:
+            accumulator[name] = ak.sum(sys["weight"] * sys[name])
 
     def fill_cutflows(self, data, systematics, cut, done_steps, cats):
         """Fill the cutflows for a specific step or cut
@@ -173,17 +206,15 @@ class OutputFiller:
         hist
             The histogram to add
         """
-        acc = self.output["hists"]
         # Split histograms by data set name. Summing histograms of the same
         # data set is generally much faster than summing across data sets
         # because normally the category axes for one data set are always
         # the same. Thus not summing across data sets will increase speed
         # significantly.
-        if dsname not in acc:
-            acc[dsname] = {}
-        if (cut, histname) in acc[dsname]:
+        acc = self.output["hists"][dsname]
+        if (cut, histname) in acc:
             try:
-                acc[dsname][(cut, histname)] += hist
+                acc[(cut, histname)] += hist
             except ValueError as err:
                 raise ValueError(
                     f"Error adding sys {sysname} to hist {histname} for cut"
@@ -193,8 +224,28 @@ class OutputFiller:
                     f"'no_callback=True' on all new columns set before the"
                     f" next cut") from err
         else:
-            acc[dsname][(cut, histname)] = hist
+            acc[(cut, histname)] = hist
         self.done_hists.add((cut, histname, sysname))
+
+    def _is_sysname_allowed(self, sysname):
+        """
+        Helper method to check whether a systematic should be included in
+        a histogram.
+
+        Parameters
+        ----------
+        sysname
+            The name of the systematic (e.g. "muonsf_down").
+        """
+        if self.systs_to_histogram is None:
+            return True
+        else:
+            if "_" in sysname:
+                sysname_split = sysname.split("_")
+                if sysname_split[-1] == "down" or sysname_split[-1] == "up" \
+                        or sysname_split[-1].isdigit():
+                    sysname = "_".join(sysname_split[:-1])
+            return sysname in self.systs_to_histogram
 
     def fill_hists(self, data, systematics, cut, done_steps, cats):
         """Fill the histograms for a specific step or cut
@@ -227,6 +278,8 @@ class OutputFiller:
                 if syscol == "weight":
                     sysname = "nominal"
                     sysweight = systematics["weight"]
+                elif not self._is_sysname_allowed(syscol):
+                    continue
                 else:
                     sysname = syscol
                     sysweight = systematics["weight"] * systematics[syscol]
@@ -238,6 +291,9 @@ class OutputFiller:
         else:
             weight = None
         for histname, fill_func in self.hist_dict.items():
+            # Check if data is blinded for this histogram
+            if getattr(fill_func, "blind_data", False) and not self.is_mc:
+                continue
             if (fill_func.step_requirement is not None
                     and fill_func.step_requirement not in done_steps):
                 continue
@@ -245,8 +301,10 @@ class OutputFiller:
                 if self.sys_overwrite is not None:
                     sysname = self.sys_overwrite
                     # But only if we want to compute systematics
-                    if do_systematics:
+                    if do_systematics and fill_func.do_systs:
                         if (cut, histname, sysname) in self.done_hists:
+                            continue
+                        elif not self._is_sysname_allowed(sysname):
                             continue
 
                         sys_hist = fill_func(

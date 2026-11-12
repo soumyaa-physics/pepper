@@ -127,6 +127,34 @@
             ]
         }
     },
+    "jet_eta_phi": {
+        "bins": [
+            {
+                "name": "eta",
+                "label": "Jet $\\eta$",
+                "n_or_arr": 52,
+                "lo": -2.6,
+                "hi": 2.6
+            },
+            {
+                "name": "phi",
+                "label": "Jet $\\varphi$",
+                "n_or_arr": 40,
+                "lo": -3.14,
+                "hi": 3.14
+            }
+        ],
+        "fill": {
+            "eta": [
+                "Jet",
+                "eta"
+            ],
+            "phi": [
+                "Jet",
+                "phi"
+            ]
+        }
+    },
     "btageff": {
         # Used in the production of btagging SFs
         "bins": [

@@ -1,7 +1,12 @@
 import os
-import pepper
+import logging
+
 import hist as hi
 import uproot
+
+import pepper
+
+logger = logging.getLogger(__name__)
 
 
 class Processor(pepper.Processor):
@@ -9,6 +14,8 @@ class Processor(pepper.Processor):
         self.data_pu_hist = config["data_pu_hist"]
         self.data_pu_hist_up = config["data_pu_hist_up"]
         self.data_pu_hist_down = config["data_pu_hist_down"]
+        self.year = config["year"]
+        config.check_integrity = False
 
         datahist, datahistup, datahistdown = self.load_input_hists()
         if len(datahist.axes) != 1:
@@ -36,26 +43,51 @@ class Processor(pepper.Processor):
             "fill": {
                 self.axisname: [
                     "Pileup",
-                    "nTrueInt"
+                    "nTrueInt",
+                    {"function": "int"}
                 ]
             }
         }
-        if isinstance(datahist.axes[0], hi.axis.Regular):
+        if (isinstance(datahist.axes[0], hi.axis.Regular)
+                or isinstance(datahist.axes[0], hi.axis.Integer)):
             ax = datahist.axes[0]
+            lo_edge = ax.value(0)
+            hi_edge = ax.value(len(ax))
             hist_config["bins"][0].update({
                 "n_or_arr": len(ax),
-                "lo": ax.value(0),
-                "hi": ax.value(len(ax))
+                "lo": lo_edge,
+                "hi": hi_edge
             })
+            if (int(lo_edge) == lo_edge) and (int(hi_edge) == hi_edge):
+                # Integer bin edges may cause numerical problems for regular
+                # axes - use integer axis if possible
+                if (hi_edge - lo_edge) == len(ax):
+                    hist_config["bins"][0].update({
+                        "lo": int(lo_edge),
+                        "hi": int(hi_edge),
+                        "type": "int"
+                    })
+                else:
+                    logger.warning(
+                        "Using regular axis, which may have issues with "
+                        "integer bin edges - please check your output")
         else:
+            logger.warning(
+                "Using variable axis, which may have issues with integer bin "
+                "edges - please check your output")
             hist_config["bins"][0]["n_or_arr"] = datahist.axes[0].edges
         config["hists"] = {"pileup": pepper.HistDefinition(hist_config)}
         if "hists_to_do" in config:
             del config["hists_to_do"]
+        if "cuts_to_histogram" in config:
+            del config["cuts_to_histogram"]
         config["compute_systematics"] = False
         # Treat all datasets as normal datasets, instead of using them as
-        # systematic
+        # systematics
         config["dataset_for_systematics"] = {}
+        # Set mc_lumifactors to true, to prevent pepper trying to calculate these for the case
+        # of mc_lumifactors: false. These are irrelevant in any case when computing pileup weights
+        config["mc_lumifactors"] = True
 
         super().__init__(config, eventdir)
 
@@ -101,7 +133,11 @@ class Processor(pepper.Processor):
                         (datahist, ""), (datahistup, "_up"),
                         (datahistdown, "_down")]:
                     datahist_i = datahist_i * is_nonzero
-                    norm = datahist_i.sum().value
+                    if isinstance(datahist_i.storage_type(),
+                                  hi.storage.Weight):
+                        norm = datahist_i.sum().value
+                    else:
+                        norm = datahist_i.sum()
                     ratio = datahist_i / norm / denom
 
                     f[dataset + suffix] = ratio

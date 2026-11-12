@@ -3,15 +3,15 @@ import numpy as np
 import awkward as ak
 import coffea
 import coffea.lumi_tools
-import coffea.jetmet_tools
 import uproot
 import logging
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import pepper
-from pepper import sonnenschein, betchart
+from pepper import sonnenschein
 import pepper.config
+from pepper.misc import get_run_for_year, LHCRun
 
 
 @dataclass
@@ -23,8 +23,8 @@ class VariationArg:
     name
         Name of the variation
     junc
-        First element names the jet energy uncertinty source, second element
-        names the direction in which it is varied
+        Tuple defining the jet energy uncertainty; first element is the
+        direction ("up" or "down"), second element is the uncertainty source
     jer
         Direction into which the jet energy resolution is varied. Can also be
         "central" for no variation, but smearing still being applied
@@ -53,49 +53,93 @@ class ProcessorBasicPhysics(pepper.Processor):
         """Get a list of varations that should be done for the Jet/MET
         uncertainties"""
         ret = []
-        if ("jet_resolution" not in self.config
-                or "jet_ressf" not in self.config):
-            jer = None
-        else:
-            jer = "central"
-        ret.append(VariationArg("UncMET_up", met="up", jer=jer))
-        ret.append(VariationArg("UncMET_down", met="down", jer=jer))
-        if "jet_uncertainty" in self.config:
-            junc = self.config["jet_uncertainty"]
-            if "junc_sources_to_use" in self.config:
-                levels = self.config["junc_sources_to_use"]
+        # We split the code into two branches where code may be duplicated.
+        # TODO: remove the legacy branch when we upgrade pepper to only
+        # support new JME implementation.
+        if "jme_correctionlib_corrections" in self.config:
+            jme_config = self.config["jme_correctionlib_corrections"]
+
+            if ("jet_resolution" not in jme_config
+                    or "jet_ressf" not in jme_config):
+                jer = None
             else:
-                levels = junc.levels
-            for source in levels:
-                if source not in junc.levels:
-                    raise pepper.config.ConfigError(
-                        f"Source not in jet uncertainties: {source}")
-                if source == "jes":
-                    name = "Junc_"
+                jer = "central"
+            ret.append(VariationArg("UncMET_up", met="up", jer=jer))
+            ret.append(VariationArg("UncMET_down", met="down", jer=jer))
+            if "jet_uncertainty" in jme_config:
+                junc = jme_config["jet_uncertainty"]
+                levels = junc.keys()
+                for source in levels:
+                    if source == "jes":
+                        name = "Junc_"
+                    else:
+                        name = f"Junc{source.replace('_', '')}_"
+                    ret.append(VariationArg(
+                        name + "up", junc=("up", source), jer=jer))
+                    ret.append(VariationArg(
+                        name + "down", junc=("down", source), jer=jer))
+            if ("jet_resolution" in jme_config
+                    and "jet_ressf" in jme_config):
+                ret.append(VariationArg("Jer_up", jer="up"))
+                ret.append(VariationArg("Jer_down", jer="down"))
+        else:  # TODO: delete this branch when removing support for legacy JME
+            if ("jet_resolution" not in self.config
+                    or "jet_ressf" not in self.config):
+                jer = None
+            else:
+                jer = "central"
+            ret.append(VariationArg("UncMET_up", met="up", jer=jer))
+            ret.append(VariationArg("UncMET_down", met="down", jer=jer))
+            if "jet_uncertainty" in self.config:
+                junc = self.config["jet_uncertainty"]
+                if "junc_sources_to_use" in self.config:
+                    levels = self.config["junc_sources_to_use"]
                 else:
-                    name = f"Junc{source.replace('_', '')}_"
-                ret.append(VariationArg(
-                    name + "up", junc=("up", source), jer=jer))
-                ret.append(VariationArg(
-                    name + "down", junc=("down", source), jer=jer))
-        if "jet_resolution" in self.config and "jet_ressf" in self.config:
-            ret.append(VariationArg("Jer_up", jer="up"))
-            ret.append(VariationArg("Jer_down", jer="down"))
+                    levels = junc.levels
+                for source in levels:
+                    if source not in junc.levels:
+                        raise pepper.config.ConfigError(
+                            f"Source not in jet uncertainties: {source}")
+                    if source == "jes":
+                        name = "Junc_"
+                    else:
+                        name = f"Junc{source.replace('_', '')}_"
+                    ret.append(VariationArg(
+                        name + "up", junc=("up", source), jer=jer))
+                    ret.append(VariationArg(
+                        name + "down", junc=("down", source), jer=jer))
+            if "jet_resolution" in self.config and "jet_ressf" in self.config:
+                ret.append(VariationArg("Jer_up", jer="up"))
+                ret.append(VariationArg("Jer_down", jer="down"))
         return ret
 
     def get_jetmet_nominal_arg(self):
         """Get a ``VariationArg`` describing the nominal evaluation"""
-        if "jet_resolution" in self.config and "jet_ressf" in self.config:
+        if "jme_correctionlib_corrections" in self.config:
+            jme_conf = self.config["jme_correctionlib_corrections"]
+        else:
+            jme_conf = self.config
+        if "jet_resolution" in jme_conf and "jet_ressf" in jme_conf:
             return VariationArg(None)
         else:
             return VariationArg(None, jer=None)
 
+    def columns_to_preload(self):
+        """If running with systematics, explicitly preload generator weights
+        since the tracing misses those"""
+        columns = super().columns_to_preload()
+        if self.config["compute_systematics"]:
+            return columns | \
+                {"LHEScaleWeight", "LHEPdfWeight", "PSWeight"}
+        else:
+            return columns
+
     def gentop(self, data):
         """Return generator-level tops."""
         part = data["GenPart"]
-        part = part[~ak.is_none(part.parent, axis=1)]
-        part = part[part.hasFlags("isLastCopy")]
-        part = part[abs(part.pdgId) == 6]
+        part = part[(part.genPartIdxMother != -1)
+                    & part.hasFlags("isLastCopy")
+                    & (abs(part.pdgId) == 6)]
         part = part[ak.argsort(part.pdgId, ascending=False)]
         return part
 
@@ -121,12 +165,12 @@ class ProcessorBasicPhysics(pepper.Processor):
         """Pileup reweighting"""
         ntrueint = data["Pileup"]["nTrueInt"]
         weighter = self.config["pileup_reweighting"]
-        weight = weighter(dsname, ntrueint)
+        weight = weighter(dsname=dsname, NumTrueInteractions=ntrueint)
         if self.config["compute_systematics"]:
             # If central is zero, let up and down factors also be zero
             weight_nonzero = np.where(weight == 0, np.inf, weight)
-            up = weighter(dsname, ntrueint, "up")
-            down = weighter(dsname, ntrueint, "down")
+            up = weighter(dsname=dsname, NumTrueInteractions=ntrueint, variation="up")
+            down = weighter(dsname=dsname, NumTrueInteractions=ntrueint, variation="down")
             sys = {"pileup": (up / weight_nonzero, down / weight_nonzero)}
             return weight, sys
         return weight
@@ -135,35 +179,37 @@ class ProcessorBasicPhysics(pepper.Processor):
         """Matrix-element renormalization and factorization scale"""
         # Get describtion of individual columns of this branch with
         # Events->GetBranch("LHEScaleWeight")->GetTitle() in ROOT
-        data = selector.data
-        if dsname + "_LHEScaleSumw" in self.config["mc_lumifactors"]:
+        if "LHEScaleWeight" not in data.fields:
+            logger.warning("LHEScaleWeights missing for this sample")
+            return
+        lheweight = data["LHEScaleWeight"]
+        if len(lheweight) == 0:
+            return
+        if (self.config["mc_lumifactors"] and dsname + "_LHEScaleSumw"
+                in self.config["mc_lumifactors"]):
             norm = self.config["mc_lumifactors"][dsname + "_LHEScaleSumw"]
-            if len(norm) == 44:
-                # See https://github.com/cms-nanoAOD/cmssw/issues/537
-                idx = [34, 5, 24, 15]
-            elif len(norm) == 9:
-                # This appears to be the standard case for most data sets
-                idx = [7, 1, 5, 3]
-            elif len(norm) == 8:
-                # Same as length 9, just missing the nominal weight at index 4
-                idx = [6, 1, 4, 3]
-            elif len(norm) == 18:
-                # Two sets of scale varations. From the titles in NanoAOD
-                # the exact order is not clear. Assume the right one comes
-                # first.
-                idx = [14, 2, 10, 6]
-            else:
-                raise RuntimeError(
-                    "Unexpected length of the norm for LHEScaleWeight: "
-                    f"{len(norm)}")
+            idx = pepper.misc.get_lhe_scale_idxs(len(norm))
             selector.set_systematic(
                 "MEren",
-                data["LHEScaleWeight"][:, idx[0]] * abs(norm[idx[0]]),
-                data["LHEScaleWeight"][:, idx[1]] * abs(norm[idx[1]]))
+                lheweight[:, idx[0]] * abs(norm[idx[0]]),
+                lheweight[:, idx[1]] * abs(norm[idx[1]]))
             selector.set_systematic(
                 "MEfac",
-                data["LHEScaleWeight"][:, idx[2]] * abs(norm[idx[2]]),
-                data["LHEScaleWeight"][:, idx[3]] * abs(norm[idx[3]]))
+                lheweight[:, idx[2]] * abs(norm[idx[2]]),
+                lheweight[:, idx[3]] * abs(norm[idx[3]]))
+        elif (not self.config["mc_lumifactors"]
+              and "LHEScaleWeight" in ak.fields(data)
+              and ak.num(lheweight)[0] > 0):
+            idx = pepper.misc.get_lhe_scale_idxs(
+                len(lheweight[0]))
+            selector.set_systematic(
+                "MEren", lheweight[:, idx[0]],
+                lheweight[:, idx[1]], norm_post=True)
+            selector.set_systematic(
+                "MEfac", lheweight[:, idx[2]],
+                lheweight[:, idx[3]], norm_post=True)
+        else:
+            logger.warning("LHEScaleWeights missing for this sample")
 
     def add_ps_uncertainties(self, selector, data):
         """Parton shower scale uncertainties"""
@@ -189,7 +235,7 @@ class ProcessorBasicPhysics(pepper.Processor):
                 selector.set_systematic(
                     "PSfsr", psweight[:, 3], psweight[:, 1])
         else:
-            raise RuntimeError(
+            logger.warning(
                 "Unexpected length of the PSWeight: "
                 f"{num_weights}")
 
@@ -197,32 +243,41 @@ class ProcessorBasicPhysics(pepper.Processor):
         """Add PDF uncertainties, using the methods described here:
         https://arxiv.org/pdf/1510.03865.pdf#section.6"""
         if ("LHEPdfWeight" not in data.fields
-                or "pdf_types" not in self.config):
+                or ak.num(data["LHEPdfWeight"])[0] == 0):
+            logger.warning("LHEPdfWeights missing for this sample")
+            return
+        if len(data["LHEPdfWeight"]) == 0:
+            return
+        if "pdf_types" not in self.config:
+            logger.warning("Not processing pdfs due to missing 'pdf_types' "
+                           "in config!")
             return
 
-        split_pdf_uncs = False
-        if "split_pdf_uncs" in self.config:
-            split_pdf_uncs = self.config["split_pdf_uncs"]
         pdfs = data["LHEPdfWeight"]
-
-        normalize_pdf_uncs = False
-        if "normalize_pdf_uncs" in self.config:
-            normalize_pdf_uncs = self.config["normalize_pdf_uncs"]
-
         pdf_doc = pdfs.__doc__
         pdf_type = None
+
         for LHA_ID, _type in self.config["pdf_types"].items():
             if LHA_ID in pdf_doc:
                 pdf_type = _type.lower()
 
-        if normalize_pdf_uncs:
-            if dsname + "_LHEPdfSumw" not in self.config["mc_lumifactors"]:
-                raise pepper.config.ConfigError(
-                    "Missing lumifactors for PDF uncertainties for dataset "
-                    f"'{dsname}'. Please run compute_mc_lumifactors.py with "
-                    "the '-p' option.")
-            norm = self.config["mc_lumifactors"][dsname + "_LHEPdfSumw"]
-            pdfs = pdfs * abs(np.array(norm)[np.newaxis, :])
+        split_pdf_uncs = False
+        if "split_pdf_uncs" in self.config:
+            split_pdf_uncs = self.config["split_pdf_uncs"]
+
+        norm_pdf_uncs_post = False
+        if ("normalize_pdf_uncs" in self.config
+                and self.config["normalize_pdf_uncs"]):
+            if self.config["mc_lumifactors"]:
+                if dsname + "_LHEPdfSumw" not in self.config["mc_lumifactors"]:
+                    raise pepper.config.ConfigError(
+                        "Missing lumifactors for PDF uncertainties for dataset"
+                        f" '{dsname}'. Please run compute_mc_lumifactors.py "
+                        "with the '-p' option.")
+                norm = self.config["mc_lumifactors"][dsname + "_LHEPdfSumw"]
+                pdfs = pdfs * abs(np.array(norm)[np.newaxis, :])
+            else:
+                norm_pdf_uncs_post = True
 
         # Check if sample has alpha_s variations - currently assuming number of
         # regular variations is a multiple of 10
@@ -247,20 +302,21 @@ class ProcessorBasicPhysics(pepper.Processor):
                 selector.set_systematic(
                     "PDF", *[pdfs[:, i] - pdfs[:, 0] + 1
                              for i in range(1, num_variation)],
-                    scheme="numeric")
+                    scheme="numeric", norm_post=norm_pdf_uncs_post)
                 if has_as_unc:
                     selector.set_systematic(
                         "PDFalphas",
                         pdfs[:, -1] - pdfs[:, 0] + 1,
-                        pdfs[:, -2] - pdfs[:, 0] + 1)
+                        pdfs[:, -2] - pdfs[:, 0] + 1,
+                        norm_post=norm_pdf_uncs_post)
             elif pdf_type.startswith("mc"):
                 selector.set_systematic(
-                    "PDF",
-                    *[pdfs[:, i] for i in range(num_variation)],
-                    scheme="numeric")
+                    "PDF", *[pdfs[:, i] for i in range(num_variation)],
+                    scheme="numeric", norm_post=norm_pdf_uncs_post)
                 if has_as_unc:
                     selector.set_systematic(
-                        "PDFalphas", pdfs[:, -1], pdfs[:, -2])
+                        "PDFalphas", pdfs[:, -1], pdfs[:, -2],
+                        norm_post=norm_pdf_uncs_post)
             elif pdf_type is None:
                 raise pepper.config.ConfigError(
                     "PDF LHA Id not included in config. PDF docstring is: "
@@ -481,10 +537,10 @@ class ProcessorBasicPhysics(pepper.Processor):
     def mpv_quality(self, data):
         """Check quality of primary vertex."""
         # Does not include check for fake. Is this even needed?
-        R = np.hypot(data["PV_x"], data["PV_y"])
-        return ((data["PV_chi2"] != 0)
-                & (data["PV_ndof"] > 4)
-                & (abs(data["PV_z"]) <= 24)
+        R = np.hypot(data["PV"]["x"], data["PV"]["y"])
+        return ((data["PV"]["chi2"] != 0)
+                & (data["PV"]["ndof"] > 4)
+                & (abs(data["PV"]["z"]) <= 24)
                 & (R <= 2))
 
     def met_filters(self, is_mc, data):
@@ -492,26 +548,30 @@ class ProcessorBasicPhysics(pepper.Processor):
         year = str(self.config["year"]).lower()
         if not self.config["apply_met_filters"]:
             return np.full(data.shape, True)
-        else:
-            passing_filters =\
-                (data["Flag"]["goodVertices"]
-                 & data["Flag"]["globalSuperTightHalo2016Filter"]
-                 & data["Flag"]["HBHENoiseFilter"]
-                 & data["Flag"]["HBHENoiseIsoFilter"]
-                 & data["Flag"]["EcalDeadCellTriggerPrimitiveFilter"]
-                 & data["Flag"]["BadPFMuonFilter"])
-            if not is_mc:
-                passing_filters = (
-                    passing_filters & data["Flag"]["eeBadScFilter"])
+        passing_filters = (
+            data["Flag"]["goodVertices"]
+            & data["Flag"]["globalSuperTightHalo2016Filter"]
+            & data["Flag"]["EcalDeadCellTriggerPrimitiveFilter"]
+            & data["Flag"]["BadPFMuonFilter"])
+
+        if not (year in ("2016", "2017", "2018") and is_mc):
+            passing_filters = (
+                passing_filters & data["Flag"]["eeBadScFilter"])
+
+        if get_run_for_year(year) == LHCRun.Run2:
+            passing_filters = (
+                passing_filters & data["Flag"]["HBHENoiseFilter"]
+                & data["Flag"]["HBHENoiseIsoFilter"])
+        elif get_run_for_year(year) == LHCRun.Run3:
+            passing_filters = (
+                passing_filters & data["Flag"]["BadPFMuonDzFilter"]
+                & data["Flag"]["hfNoisyHitsFilter"])
         if year in ("2018", "2017"):
             passing_filters = (
                 passing_filters & data["Flag"]["ecalBadCalibFilterV2"])
-        if year in ("ul2018", "ul2017"):
+        if year in ("ul2018", "ul2017", "2024"):
             passing_filters = (
                 passing_filters & data["Flag"]["ecalBadCalibFilter"])
-        if year in ("ul2018", "ul2017", "ul2016post", "ul2016pre"):
-            passing_filters = (
-                passing_filters & data["Flag"]["eeBadScFilter"])
 
         return passing_filters
 
@@ -521,30 +581,43 @@ class ProcessorBasicPhysics(pepper.Processor):
 
     def electron_id(self, e_id, electron):
         """Check if electrons have ID specified in the config file."""
+        year = self.config["year"]
         if e_id == "skip":
             has_id = True
-        if e_id == "cut:loose":
+        elif e_id == "cut:loose":
             has_id = electron["cutBased"] >= 2
         elif e_id == "cut:medium":
             has_id = electron["cutBased"] >= 3
         elif e_id == "cut:tight":
             has_id = electron["cutBased"] >= 4
         elif e_id == "mva:noIso80":
-            has_id = electron["mvaFall17V2noIso_WP80"]
+            if get_run_for_year(year) == LHCRun.Run3:
+                has_id = electron["mvaNoIso_WP80"]
+            else:
+                has_id = electron["mvaFall17V2noIso_WP80"]
         elif e_id == "mva:noIso90":
-            has_id = electron["mvaFall17V2noIso_WP90"]
+            if get_run_for_year(year) == LHCRun.Run3:
+                has_id = electron["mvaNoIso_WP90"]
+            else:
+                has_id = electron["mvaFall17V2noIso_WP90"]
         elif e_id == "mva:Iso80":
-            has_id = electron["mvaFall17V2Iso_WP80"]
+            if get_run_for_year(year) == LHCRun.Run3:
+                has_id = electron["mvaIso_WP80"]
+            else:
+                has_id = electron["mvaFall17V2Iso_WP80"]
         elif e_id == "mva:Iso90":
-            has_id = electron["mvaFall17V2Iso_WP90"]
+            if get_run_for_year(year) == LHCRun.Run3:
+                has_id = electron["mvaIso_WP90"]
+            else:
+                has_id = electron["mvaFall17V2Iso_WP90"]
         else:
             raise ValueError("Invalid electron id string")
         return has_id
 
     def electron_cuts(self, electron, good_lep):
         """Apply some basic electron quality cuts.
-        If good_lep is True, config values prefixed with 'good_' for pt and ID
-        are used. Otherwise the ones with prefix 'additional_' are used."""
+        If ``good_lep`` is True, config values prefixed with ``good_`` for pt and ID
+        are used. Otherwise the ones with prefix ``additional_`` are used."""
         if self.config["ele_cut_transreg"]:
             sc_eta_abs = abs(electron["eta"]
                              + electron["deltaEtaSC"])
@@ -620,8 +693,8 @@ class ProcessorBasicPhysics(pepper.Processor):
 
     def muon_cuts(self, muon, good_lep):
         """Apply some basic muon quality cuts
-        If good_lep is True, config values prefixed with 'good_' for pt, ID
-        and iso are used. Otherwise the ones with prefix 'additional_' are
+        If ``good_lep`` is True, config values prefixed with ``good_`` for pt, ID
+        and iso are used. Otherwise the ones with prefix ``additional_`` are
         used."""
         if self.config["muon_cut_transreg"]:
             is_in_transreg = self.in_transreg(abs(muon["eta"]))
@@ -647,8 +720,9 @@ class ProcessorBasicPhysics(pepper.Processor):
         muons = data["Muon"]
         return muons[self.muon_cuts(muons, good_lep=True)]
 
-    def apply_rochester_corr(self, muons, rng, is_mc):
+    def apply_rochester_corr(self, rng, is_mc, data):
         """Apply Rochester corrections for muons."""
+        muons = data["Muon"]
         if not is_mc:
             dtSF = self.config["muon_rochester"].kScaleDT(
                 muons["charge"], muons["pt"], muons["eta"], muons["phi"]
@@ -683,13 +757,10 @@ class ProcessorBasicPhysics(pepper.Processor):
             muons["pt"] = muons["pt"] * mcSF
         return muons
 
-    def build_lepton_column(self, is_mc, rng, data):
+    def build_lepton_column(self, data):
         """Build a lepton column containing electrons and muons."""
         electron = data["Electron"]
         muon = data["Muon"]
-        # Apply Rochester corrections to muons
-        if "muon_rochester" in self.config:
-            muon = self.apply_rochester_corr(muon, rng, is_mc)
         columns = ["pt", "eta", "phi", "mass", "pdgId"]
         lepton = {}
         for column in columns:
@@ -782,30 +853,63 @@ class ProcessorBasicPhysics(pepper.Processor):
         """Return invariant mass of lepton pair."""
         return (data["Lepton"][:, 0] + data["Lepton"][:, 1]).mass
 
-    def compute_jec_factor(self, is_mc, data, pt=None, eta=None, area=None,
-                           rho=None, raw_factor=None):
+    def compute_jec_factor(self, is_mc, era, name_jet, data, pt=None, eta=None,
+                           phi=None, area=None, rho=None, raw_factor=None):
         """Return jet energy correction factor."""
+        if name_jet != "Jet" and name_jet != "FatJet":
+            raise ValueError("{} is not allowed for jec. Viable options: Jet, FatJet"
+                             .format(name_jet))
         if pt is None:
-            pt = data["Jet"].pt
+            pt = data[name_jet].pt
         if eta is None:
-            eta = data["Jet"].eta
+            eta = data[name_jet].eta
+        if phi is None:
+            phi = data[name_jet].phi
         if area is None:
-            area = data["Jet"].area
+            area = data[name_jet].area
         if rho is None:
             if "Rho" in data.fields:
                 rho = data["Rho"]["fixedGridRhoFastjetAll"]
             else:
                 rho = data["fixedGridRhoFastjetAll"]
         if raw_factor is None:
-            raw_factor = 1 - data["Jet"]["rawFactor"]
+            raw_factor = 1 - data[name_jet]["rawFactor"]
         if is_mc:
-            jec = self.config["jet_correction_mc"]
+            if name_jet == "Jet":
+                if self.config.get('jme_correctionlib_corrections'):
+                    jec = self.config['jme_correctionlib_corrections']["jet_correction_mc"]
+                else:
+                    jec = self.config["jet_correction_mc"]
+            elif name_jet == "FatJet":  # Not `else` for readability
+                if self.config.get('fatjet_jme_correctionlib_corrections'):
+                    jec = self.config['fatjet_jme_correctionlib_corrections']["jet_correction_mc"]
+                else:
+                    raise ValueError("FatJet JEC requires 'fatjet_jme_correctionlib_corrections'!")
         else:
-            jec = self.config["jet_correction_data"]
+            if name_jet == "Jet":
+                if self.config.get('jme_correctionlib_corrections'):
+                    jec = self.config['jme_correctionlib_corrections']["jet_correction_data"]
+                else:
+                    jec = self.config["jet_correction_data"]
+            elif name_jet == "FatJet":  # Not `else` for readability
+                if self.config.get('fatjet_jme_correctionlib_corrections'):
+                    jec = self.config['fatjet_jme_correctionlib_corrections']["jet_correction_data"]
+                else:
+                    raise ValueError("FatJet JEC requires 'fatjet_jme_correctionlib_corrections'!")
+            if isinstance(jec, dict):
+                jec = jec[era]
 
         raw_pt = pt * raw_factor
-        l1l2l3 = jec.getCorrection(
-            JetPt=raw_pt, JetEta=eta, JetA=area, Rho=rho)
+        if (self.config.get("jme_correctionlib_corrections")
+                or self.config.get('fatjet_jme_correctionlib_corrections')):
+            l1l2l3 = jec(
+                JetPt=raw_pt, JetEta=eta, JetPhi=phi, JetA=area, Rho=rho, run=data.run)
+        elif self.config["year"] == "2023post":
+            l1l2l3 = jec(
+                JetPt=raw_pt, JetEta=eta, JetPhi=phi, JetA=area, Rho=rho)
+        else:
+            l1l2l3 = jec(
+                JetPt=raw_pt, JetEta=eta, JetA=area, Rho=rho)
         return raw_factor * l1l2l3
 
     def get_junc_factor_mask(self, data, source, pt, eta, flavor):
@@ -818,39 +922,70 @@ class ProcessorBasicPhysics(pepper.Processor):
         """
         return None  # To be modified in subclasses
 
-    def compute_junc_factor(self, data, variation, source="jes", pt=None,
+    def compute_junc_factor(self, data, name_jet, variation, source="jes", pt=None,
                             eta=None, flavor=None):
         """Return jet energy correction uncertainty factor."""
+        if name_jet != "Jet" and name_jet != "FatJet":
+            raise ValueError("{} is not allowed for junc. Viable options: Jet, FatJet"
+                             .format(name_jet))
         if variation not in ("up", "down"):
             raise ValueError("variation must be either 'up' or 'down'")
-        if source not in self.config["jet_uncertainty"].levels:
-            raise ValueError(f"Jet uncertainty not found: {source}")
         if pt is None:
-            pt = data["Jet"].pt
+            pt = data[name_jet].pt
         if eta is None:
-            eta = data["Jet"].eta
-        if flavor is None:
-            flavor = data["Jet"].partonFlavour
+            eta = data[name_jet].eta
+        if (name_jet == "Jet" and flavor is None):  # FatJet doesn't support parton flavor
+            flavor = data[name_jet].partonFlavour
         counts = ak.num(pt)
         if ak.sum(counts) == 0:
             return ak.unflatten([], counts)
-        junc = dict(self.config["jet_uncertainty"].getUncertainty(
-            JetPt=pt, JetEta=eta))[source]
-        junc = junc[:, :, 0 if variation == "up" else 1]
-        mask = self.get_junc_factor_mask(data, source, pt, eta, flavor)
-        if mask is not None:
-            junc = ak.where(mask, junc, ak.ones_like(junc))
+        if name_jet == "Jet":
+            if "jme_correctionlib_corrections" in self.config:
+                junc = self.config['jme_correctionlib_corrections']["jet_uncertainty"][source](
+                        JetPt=pt, JetEta=eta)
+                # Symmetric according to this:
+                # https://cms-jerc.web.cern.ch/JECUncertaintySources/#description
+                junc = 1+junc if variation == "up" else 1-junc
+            else:
+                junc = dict(self.config["jet_uncertainty"](
+                    JetPt=pt, JetEta=eta))[source]
+                junc = junc[:, :, 0 if variation == "up" else 1]
+            mask = self.get_junc_factor_mask(data, source, pt, eta, flavor)
+            if mask is not None:
+                junc = ak.where(mask, junc, ak.ones_like(junc))
+        elif name_jet == "FatJet":  # Not `else` for readability
+            if "fatjet_jme_correctionlib_corrections" in self.config:
+                junc = self.config['fatjet_jme_correctionlib_corrections']["jet_uncertainty"][source](
+                        JetPt=pt, JetEta=eta)
+                junc = 1+junc if variation == "up" else 1-junc
+            else:
+                raise ValueError("FatJet JUNC requires 'fatjet_jme_correctionlib_corrections'!")
         return junc
 
-    def compute_jer_factor(self, data, rng, variation="central", pt=None,
+    def find_matched_genjet(self, jer, jets, r=0.4):
+        """Find a matched GenJet for the purpose of JER smearing,
+        passing the requirements for matching according to JME.
+        See https://cms-jerc.web.cern.ch/JER """
+        genjet = jets.matched_gen
+        deltar = jets.delta_r(genjet)
+        rel_dpt = abs(jets.pt - genjet.pt)/jets.pt
+
+        is_matched = (deltar < 0.5*r) & (rel_dpt < 3 * jer)
+        genjets_matched = ak.mask(genjet, is_matched)
+        return genjets_matched
+
+    def compute_jer_factor(self, data, rng, name_jet, variation="central", pt=None,
                            eta=None, hybrid=True):
         """Return jet energy resolution factor."""
         # Coffea offers a class named JetTransformer for this. Unfortunately
         # it is more inconvinient and bugged than useful.
+        if name_jet != "Jet" and name_jet != "FatJet":
+            raise ValueError("{} is not allowed for jer. Viable options: Jet, FatJet"
+                             .format(name_jet))
         if pt is None:
-            pt = data["Jet"].pt
+            pt = data[name_jet].pt
         if eta is None:
-            eta = data["Jet"].eta
+            eta = data[name_jet].eta
         counts = ak.num(pt)
         if ak.sum(counts) == 0:
             return ak.unflatten([], counts)
@@ -858,42 +993,77 @@ class ProcessorBasicPhysics(pepper.Processor):
             rho = data["Rho"]["fixedGridRhoFastjetAll"]
         else:
             rho = data["fixedGridRhoFastjetAll"]
-        jer = self.config["jet_resolution"].getResolution(
-            JetPt=pt, JetEta=eta, Rho=rho)
-        jersf = self.config["jet_ressf"].getScaleFactor(
-            JetPt=pt, JetEta=eta, Rho=rho)
+        if name_jet == "Jet":
+            if self.config.get('jme_correctionlib_corrections'):
+                jer = self.config["jme_correctionlib_corrections"]["jet_resolution"](
+                    JetPt=pt, JetEta=eta, Rho=rho)
+                # this handles the JER unc in the JEC format:
+                # https://cms-jerc.web.cern.ch/JER/#smearing-procedures
+                if "jet_ressf_uncertainty" in self.config["jme_correctionlib_corrections"]:
+                    jersf = self.config["jme_correctionlib_corrections"]["jet_ressf"](
+                        JetPt=pt, JetEta=eta)
+                    jersf_unc = self.config["jme_correctionlib_corrections"]["jet_ressf_uncertainty"](
+                        JetPt=pt, JetEta=eta)
+                    if variation == "central":
+                        jersf = jersf
+                    elif variation == "up":
+                        jersf = jersf*(1+jersf_unc)
+                    elif variation == "down":
+                        jersf = jersf*(1-jersf_unc)
+                    else:
+                        raise ValueError("variation must be one of 'central', 'up' or 'down'")
+                else:
+                    jersf = self.config["jme_correctionlib_corrections"]["jet_ressf"](
+                        JetPt=pt, JetEta=eta, Rho=rho, variation=variation)
+            else:
+                jer = self.config["jet_resolution"](
+                    JetPt=pt, JetEta=eta, Rho=rho)
+                jersf = self.config["jet_ressf"](
+                    JetPt=pt, JetEta=eta, Rho=rho)
+                if variation == "central":
+                    jersf = jersf[:, :, 0]
+                elif variation == "up":
+                    jersf = jersf[:, :, 1]
+                elif variation == "down":
+                    jersf = jersf[:, :, 2]
+                else:
+                    raise ValueError("variation must be one of 'central', 'up' or 'down'")
+        elif name_jet == "FatJet":  # Not `else` for readability
+            if self.config.get('fatjet_jme_correctionlib_corrections'):
+                jer = self.config["fatjet_jme_correctionlib_corrections"]["jet_resolution"](
+                        JetPt=pt, JetEta=eta, Rho=rho)
+                jersf = self.config["fatjet_jme_correctionlib_corrections"]["jet_ressf"](
+                        JetPt=pt, JetEta=eta, Rho=rho, variation=variation)
+            else:
+                raise ValueError("FatJet JER requires 'fatjet_jme_correctionlib_corrections'!")
         jersmear = jer * rng.normal(size=len(jer))
-        if variation == "central":
-            jersf = jersf[:, :, 0]
-        elif variation == "up":
-            jersf = jersf[:, :, 1]
-        elif variation == "down":
-            jersf = jersf[:, :, 2]
-        else:
-            raise ValueError("variation must be one of 'central', 'up' or "
-                             "'down'")
         factor_stoch = 1 + np.sqrt(np.maximum(jersf**2 - 1, 0)) * jersmear
         if hybrid:
             # Hybrid method: Apply scaling relative to genpt if possible
-            genpt = data["Jet"].matched_gen.pt
+            if name_jet == "Jet":
+                matched_genjets = self.find_matched_genjet(jer, data[name_jet], 0.4)
+            elif name_jet == "FatJet":  # Not `else` for readability
+                matched_genjets = self.find_matched_genjet(jer, data[name_jet], 0.8)
+            genpt = matched_genjets.pt
             factor_scale = 1 + (jersf - 1) * (pt - genpt) / pt
             factor = ak.where(
                 ak.is_none(genpt, axis=1), factor_stoch, factor_scale)
+            factor = ak.drop_none(factor)
         else:
             factor = factor_stoch
         return factor
 
-    def compute_jet_factors(self, is_mc, jec, junc, jer, rng, data):
+    def compute_jet_factors(self, is_mc, era, jec, junc, jer, rng, data):
         """Return total jet factor."""
         factor = ak.ones_like(data["Jet"].pt)
         if jec:
-            jecfac = self.compute_jec_factor(is_mc, data)
+            jecfac = self.compute_jec_factor(is_mc, era, "Jet", data)
             factor = factor * jecfac
         if is_mc and junc is not None:
-            juncfac = self.compute_junc_factor(data, *junc)
+            juncfac = self.compute_junc_factor(data, "Jet", *junc)
             factor = factor * juncfac
         if is_mc and jer is not None:
-            jerfac = self.compute_jer_factor(data, rng, jer)
+            jerfac = self.compute_jer_factor(data, rng, "Jet", jer)
             factor = factor * jerfac
         ret = {}
         if jec or (is_mc and (junc is not None or jer is not None)):
@@ -902,29 +1072,150 @@ class ProcessorBasicPhysics(pepper.Processor):
             ret["jerfac"] = jerfac
         return ret
 
-    def good_jet(self, data):
-        """Apply some basic jet quality cuts."""
-        jets = data["Jet"]
+    def compute_fatjet_factors(self, is_mc, era, jec, junc, jer, rng, data):
+        """Return total fatjet factor."""
+        fatjet_factor = ak.ones_like(data["FatJet"].pt)
+        if jec:
+            jecfac = self.compute_jec_factor(is_mc, era, "FatJet", data)
+            fatjet_factor = fatjet_factor * jecfac
+        if is_mc and junc is not None:
+            juncfac = self.compute_junc_factor(data, "FatJet", *junc)
+            fatjet_factor = fatjet_factor * juncfac
+        if is_mc and jer is not None:
+            fatjet_jerfac = self.compute_jer_factor(data, rng, "FatJet", jer)
+            fatjet_factor = fatjet_factor * fatjet_jerfac
+        ret = {}
+        if jec or (is_mc and (junc is not None or jer is not None)):
+            ret["fatjetfac"] = fatjet_factor
+        if is_mc and jer is not None:
+            ret["fatjerfac"] = fatjet_jerfac
+        return ret
+
+    def _evaluate_jet_ids(self, data, collection, config_key, prefix):
+        """Evaluate the jet IDs, which are external correctionlib files
+        starting from nano v15. They are set as separate columns since
+        they are needed for all jets (not just the ones passing the
+        analysis requirements) for the jet veto maps."""
+        jets = data[collection]
+        if "jetId" in jets.fields:  # Legacy jet ID
+            return {
+                f"{prefix}Loose": jets.isLoose,
+                f"{prefix}Tight": jets.isTight,
+                f"{prefix}TightLeptonVeto": jets.isTightLeptonVeto,
+            }
+        else:
+            jet_id_evaluator = self.config[config_key]
+            tight_id, tight_lep_veto_id = jet_id_evaluator.evaluate(jets)
+            return {
+                f"{prefix}Tight": tight_id,
+                f"{prefix}TightLeptonVeto": tight_lep_veto_id,
+            }
+
+    def evaluate_jet_ids(self, data):
+        """Evaluate jet ID for R=0.4 jets"""
+        return self._evaluate_jet_ids(
+            data,
+            collection="Jet",
+            config_key="jet_ids",
+            prefix="JetId",
+        )
+
+    def evaluate_fatjet_ids(self, data):
+        """Evaluate jet ID for R=0.8 jets"""
+        return self._evaluate_jet_ids(
+            data,
+            collection="FatJet",
+            config_key="fatjet_ids",
+            prefix="FatJetId",
+        )
+
+    def _apply_jet_veto_map_like(self, data, collection, id_field,
+                                 fac_field, veto_map_key, built_sentinel=None):
+        """Veto events with a loosely-selected jet in a jet-veto region.
+        Shared implementation for AK4 (``Jet``) and AK8 (``FatJet``).
+        The loose selection uses correction-folded pt, so this must run
+        before the corresponding build_*_column bakes the factor in."""
+        jets = data[collection]
+        if built_sentinel is not None and built_sentinel in ak.fields(jets):
+            # built_sentinel is a marker that the collection has already been
+            # built with the factor applied, so we should not apply it again.
+            # We don't have one for FatJet atm.
+            raise RuntimeError(
+                f"_apply_jet_veto_map_like expects the pre-build {collection} "
+                f"collection (factor would be applied twice). Run the veto cut "
+                f"before build of {collection}.")
+        jetid = data[id_field]
+        j_pt = jets.pt
+        if fac_field in ak.fields(data):
+            # Veto is applied after JES and JER:
+            # https://cms-jerc.web.cern.ch/ApplicationTutorial/#correction-order
+            # fac_field re-derives JES (+JUNC/JER for MC). When absent, the
+            # NanoAOD-level JES is already in jets.pt - fallback to that.
+            j_pt = j_pt * data[fac_field]
+        nominal_selection_mask = (
+            (j_pt > 15)
+            & jetid
+            & ((jets.chEmEF + jets.neEmEF) < 0.9)
+        )
+        veto_map = self.config[veto_map_key]
+        veto_jets = veto_map(eta=jets.eta[nominal_selection_mask],
+                             phi=jets.phi[nominal_selection_mask])
+        return ~ak.any(veto_jets, axis=1)
+
+    def apply_jet_veto_map(self, data):
+        """Apply the jet veto map to R=0.4 jets. See
+        https://cms-jerc.web.cern.ch/Recommendations/#jet-veto-maps."""
+        return self._apply_jet_veto_map_like(
+            data,
+            collection="Jet",
+            id_field="JetIdTightLeptonVeto",
+            fac_field="jetfac",
+            veto_map_key="jet_veto_map",
+            built_sentinel="pass_pu_id",  # pass_pu_id marks the collection as already built with the factor applied
+        )
+
+    def apply_fatjet_veto_map(self, data):
+        """Apply the jet veto map to R=0.8 jets."""
+        return self._apply_jet_veto_map_like(
+            data,
+            collection="FatJet",
+            id_field="FatJetIdTightLeptonVeto",
+            fac_field="fatjetfac",
+            veto_map_key="jet_veto_map",  # same eta-phi map
+            built_sentinel=None,  # no clean built marker on FatJet
+        )
+
+    def _good_jet_like(self, data, collection, jet_key, pt_factor_name=None):
+        """Apply some basic quality cuts to a jet-like collection."""
+        jets = data[collection]
         leptons = data["Lepton"]
         j_id, lep_dist, eta_min, eta_max, pt_min = self.config[[
-            "good_jet_id", "good_jet_lepton_distance",
-            "good_jet_eta_min", "good_jet_eta_max", "good_jet_pt_min"]]
+            f"good_{jet_key}_id",
+            f"good_{jet_key}_lepton_distance",
+            f"good_{jet_key}_eta_min",
+            f"good_{jet_key}_eta_max",
+            f"good_{jet_key}_pt_min",
+        ]]
+
+        # Jet IDs should be set in the selector using evaluate_jet_ids or evaluate_fatjet_ids
         if j_id == "skip":
             has_id = True
         elif j_id == "cut:loose":
-            has_id = jets.isLoose
+            if f"{collection}IdLoose" not in data.fields:
+                raise ValueError(f"Loose {collection} ID is not supported for this data era.")
+            has_id = data[f"{collection}IdLoose"]
             # Always False in 2017 and 2018
         elif j_id == "cut:tight":
-            has_id = jets.isTight
+            has_id = data[f"{collection}IdTight"]
         elif j_id == "cut:tightlepveto":
-            has_id = jets.isTightLeptonVeto
+            has_id = data[f"{collection}IdTightLeptonVeto"]
         else:
             raise pepper.config.ConfigError(
-                    "Invalid good_jet_id: {}".format(j_id))
+                "Invalid good_jet_id: {}".format(j_id))
 
         j_pt = jets.pt
-        if "jetfac" in ak.fields(data):
-            j_pt = j_pt * data["jetfac"]
+        if pt_factor_name is not None and pt_factor_name in ak.fields(data):
+            j_pt = j_pt * data[pt_factor_name]
         has_lepton_close = ak.any(
             jets.metric_table(leptons) < lep_dist, axis=2)
 
@@ -934,20 +1225,41 @@ class ProcessorBasicPhysics(pepper.Processor):
                 & (jets.eta < eta_max)
                 & (pt_min < j_pt))
 
+    def good_jet(self, data):
+        """Apply jet quality cuts to R=0.4 jets."""
+        return self._good_jet_like(
+            data,
+            collection="Jet",
+            jet_key="jet",
+            pt_factor_name="jetfac"
+        )
+
+    def good_fatjet(self, data):
+        """Apply jet quality cuts to R=0.8 jets."""
+        return self._good_jet_like(
+            data,
+            collection="FatJet",
+            jet_key="fatjet",
+            pt_factor_name="fatjetfac"
+        )
+
     def has_puid(self, jets):
         """Whether jets satisfy the configured pileup ID"""
         j_puId = self.config["good_jet_puId"]
+        is2016 = ("ul2016" in self.config["year"])
         if j_puId == "skip":
             has_puId = True
-        elif j_puId == "cut:loose":
+        elif ((not is2016 and j_puId == "cut:loose")
+              or (is2016 and j_puId == "cut:tight")):
             has_puId = ak.values_astype(jets["puId"] & 0b100, bool)
         elif j_puId == "cut:medium":
             has_puId = ak.values_astype(jets["puId"] & 0b10, bool)
-        elif j_puId == "cut:tight":
+        elif ((not is2016 and j_puId == "cut:tight")
+              or (is2016 and j_puId == "cut:loose")):
             has_puId = ak.values_astype(jets["puId"] & 0b1, bool)
         else:
             raise pepper.config.ConfigError(
-                    "Invalid good_jet_id: {}".format(j_puId))
+                "Invalid good_jet_id: {}".format(j_puId))
         # Only apply PUID if pT < 50 GeV
         has_puId = has_puId | (jets.pt >= 50)
         return has_puId
@@ -964,22 +1276,30 @@ class ProcessorBasicPhysics(pepper.Processor):
             jets["mass"] = jets["mass"] * data["jetfac"][is_good_jet]
             jets = jets[ak.argsort(jets["pt"], ascending=False)]
 
-        # Evaluate b-tagging
-        tagger, wp = self.config["btag"].split(":")
-        if tagger == "deepcsv":
-            jets["btag"] = jets["btagDeepB"]
-        elif tagger == "deepjet":
-            jets["btag"] = jets["btagDeepFlavB"]
-        else:
-            raise pepper.config.ConfigError(
-                "Invalid tagger name: {}".format(tagger))
-        year = self.config["year"]
-        wptuple = pepper.scale_factors.BTAG_WP_CUTS[tagger][year]
-        if not hasattr(wptuple, wp):
-            raise pepper.config.ConfigError(
-                "Invalid working point \"{}\" for {} in year {}".format(
-                    wp, tagger, year))
-        jets["btagged"] = jets["btag"] > getattr(wptuple, wp)
+        if not self.config["btag"] == "skip":
+            # Evaluate b-tagging
+            tagger, wp = self.config["btag"].split(":")
+            if tagger == "deepcsv":
+                jets["btag"] = jets["btagDeepB"]
+            elif tagger == "deepjet":
+                jets["btag"] = jets["btagDeepFlavB"]
+            elif tagger == "robustparticletransformer":
+                jets["btag"] = jets["btagRobustParTAK4B"]
+            elif tagger == "particlenet":
+                jets["btag"] = jets["btagPNetB"]
+            elif tagger == "upart":
+                jets["btag"] = jets["btagUParTAK4B"]
+            else:
+                raise pepper.config.ConfigError(
+                    "Invalid tagger name: {}".format(tagger))
+            year = self.config["year"]
+            if "btag_wps" in self.config and self.config["btag_wps"]:
+                _, _, wp_val = self.config["btag_wps"](wp)
+            else:
+                raise pepper.config.ConfigError(
+                    f"btag_wps not in config, or does not define wps for "
+                    f"{tagger} in {year}.")
+            jets["btagged"] = jets["btag"] > wp_val
         jets["pass_pu_id"] = self.has_puid(jets)
         if is_mc:
             # A jet is considered to be a pileup jet if there is no gen jet
@@ -993,7 +1313,75 @@ class ProcessorBasicPhysics(pepper.Processor):
         jets = data["Jet"]
         return jets[jets.pass_pu_id]
 
-    def build_lowptjet_column(self, is_mc, junc, jer, rng, data):
+    def contain_qqb(self, fatjet, part):
+        """Match fat jets to qqb from top decay"""
+        # Parton is from the hard-process before radiation
+        part = part[part.hasFlags("isFirstCopy", "fromHardProcess")]
+        part = part[part.genPartIdxMother >= 0]  # Parton is not from the initial state
+        mother = part.distinctParent
+        grandmom = mother.distinctParent
+        partId = abs(part.pdgId)
+        momId = abs(mother.pdgId)
+        # For ttW, the W might be offshell and the mother becomes an initial parton
+        grandId = ak.fill_none(abs(grandmom.pdgId), 0)
+        b_from_top = part[(partId == 5) & (momId == 6)]
+        q_frW_frT = part[(partId < 6) & (momId == 24) & (grandId == 6)]
+
+        dR_B = ak.fill_none(fatjet.metric_table(b_from_top), 10.)
+        B_inside = ak.any(dR_B < 0.8, axis=2)
+
+        dR_Qt = ak.fill_none(fatjet.metric_table(q_frW_frT), 10.)
+        num_Qt_inside = ak.num(dR_Qt[dR_Qt < 0.8], axis=2)
+        Qt_inside = (num_Qt_inside >= 2)
+
+        return (B_inside & Qt_inside)
+
+    def contain_qq(self, fatjet, part):
+        """Match fat jets to qq from W decay or top jets w/o b inside"""
+        # Parton is from the hard-process before radiation
+        part = part[part.hasFlags("isFirstCopy", "fromHardProcess")]
+        part = part[part.genPartIdxMother >= 0]  # Parton is not from the initial state
+        mother = part.distinctParent
+        grandmom = mother.distinctParent
+        partId = abs(part.pdgId)
+        momId = abs(mother.pdgId)
+        # For ttW, the W might be offshell and the mother becomes an initial parton
+        grandId = ak.fill_none(abs(grandmom.pdgId), 0)
+        b_from_top = part[(partId == 5) & (momId == 6)]
+        q_frW_frT = part[(partId < 6) & (momId == 24) & (grandId == 6)]
+        q_frW = part[(partId < 6) & (momId == 24)]
+
+        dR_B = ak.fill_none(fatjet.metric_table(b_from_top), 10.)
+        B_outside = ak.all(dR_B >= 0.8, axis=2)
+
+        dR_Qt = ak.fill_none(fatjet.metric_table(q_frW_frT), 10.)
+        num_Qt_inside = ak.num(dR_Qt[dR_Qt < 0.8], axis=2)
+        Qt_inside = (num_Qt_inside >= 2)
+
+        dR_Qw = ak.fill_none(fatjet.metric_table(q_frW), 10.)
+        num_Qw_inside = ak.num(dR_Qw[dR_Qw < 0.8], axis=2)
+        Qw_inside = (num_Qw_inside >= 2)
+
+        noHadTop = (ak.num(q_frW_frT, axis=1) == 0)
+
+        return ((B_outside & Qt_inside) | (noHadTop & Qw_inside))
+
+    def build_fatjet_column(self, is_mc, data):
+        """Build a column of AK8 jets"""
+        is_good_jet = self.good_fatjet(data)
+        jets = data["FatJet"][is_good_jet]
+        if "fatjetfac" in ak.fields(data):
+            jets["pt"] = jets["pt"] * data["fatjetfac"][is_good_jet]
+            # FatJet doesn't apply JEC to jet mass
+            jets = jets[ak.argsort(jets["pt"], ascending=False)]
+
+        if is_mc:
+            has_gen_close = ak.fill_none(
+                    jets.delta_r(jets.matched_gen) < 0.8, False)
+            jets["has_gen_fatjet"] = has_gen_close
+        return jets
+
+    def build_lowptjet_column(self, is_mc, era, junc, jer, rng, data):
         """Build a column of low-pt jets, needed to propagate jet
            corrections to low-pt jets and consequently build the
            MET column."""
@@ -1002,8 +1390,8 @@ class ProcessorBasicPhysics(pepper.Processor):
         # pt > 10 GeV and |eta| < 5.2, thus cut there
         jets = jets[(jets.rawPt > 10) & (abs(jets.eta) < 5.2)]
         l1l2l3 = self.compute_jec_factor(
-            is_mc, data, jets.rawPt, jets.eta, jets.area,
-            raw_factor=ak.ones_like(jets.rawPt))
+            is_mc, era, "Jet", data, jets.rawPt, jets.eta, jets.phi,
+            jets.area, raw_factor=ak.ones_like(jets.rawPt))
         jets["pt"] = l1l2l3 * jets.rawPt
         jets["pt_nomuon"] = jets["pt"] * (1 - jets["muonSubtrFactor"])
 
@@ -1014,19 +1402,19 @@ class ProcessorBasicPhysics(pepper.Processor):
         # difference is negligible.
         if junc is not None:
             jets["juncfac"] = self.compute_junc_factor(
-                data, *junc, pt=jets["pt"], eta=jets["eta"],
+                data, "Jet", *junc, pt=jets["pt"], eta=jets["eta"],
                 flavor=np.zeros_like(jets["pt"]))
         else:
             jets["juncfac"] = ak.ones_like(jets["pt"])
         if jer is not None:
             jets["jerfac"] = self.compute_jer_factor(
-                data, rng, jer, jets["pt"], jets["eta"], False)
+                data, rng, "Jet", jer, jets["pt"], jets["eta"], False)
         else:
             jets["jerfac"] = ak.ones_like(jets["pt"])
 
         jets["emef"] = jets["mass"] = ak.zeros_like(jets["pt"])
         jets.behavior = data["Jet"].behavior
-        jets = ak.with_name(jets, "Jet")
+        jets = ak.with_name(jets, "PtEtaPhiMLorentzVector")
 
         return jets
 
@@ -1036,7 +1424,13 @@ class ProcessorBasicPhysics(pepper.Processor):
         If varation is 'up' or 'down', the unclustered MET varation (up or
         down) will be applied. If it is None or 'central', nominal MET is
         used."""
-        met = data["MET"]
+        nano_met_name = None
+        if get_run_for_year(self.config["year"]) == LHCRun.Run3:
+            default_nano_met_name = "PuppiMET"
+        else:
+            default_nano_met_name = "MET"
+        nano_met_name = self.config.get("jet_type", default_nano_met_name)
+        met = data[nano_met_name]
         metx = met.pt * np.cos(met.phi)
         mety = met.pt * np.sin(met.phi)
         if ("MET_xy_shifts" in self.config and era != "no_events"):
@@ -1047,11 +1441,66 @@ class ProcessorBasicPhysics(pepper.Processor):
             mety = mety - (metshifts["METycorr"][era][0]
                            * data["PV"]["npvs"]
                            + metshifts["METycorr"][era][1])
-
         if variation == "up":
+            if nano_met_name == "PuppiMET":
+                # Sometimes nans are in the variations as documented here:
+                # https://cms-talk.web.cern.ch/t/nan-values-in-puppimet-variations/127652/2
+                # which according to JetMET POG may be related to this issue
+                # https://github.com/cms-sw/cmssw/issues/39110. Currently,
+                # we just fall back to nominal MET in such cases but emit a
+                # warning. TODO: Remove this workaround once the issue is fixed.
+                if (
+                    np.any(np.isnan(met.ptUnclusteredUp))
+                    or np.any(np.isnan(met.phiUnclusteredUp))
+                ):
+                    import warnings
+                    warnings.warn(
+                        "NaN values found in PuppiMET unclustered energy "
+                        "up variation. Falling back to nominal MET for "
+                        "these events.")
+                    met["pt"] = np.where(np.isnan(met.ptUnclusteredUp),
+                                         met.pt,
+                                         met.ptUnclusteredUp
+                                         )
+                    met["phi"] = np.where(np.isnan(met.phiUnclusteredUp),
+                                          met.phi,
+                                          met.phiUnclusteredUp
+                                          )
+                else:
+                    met["pt"] = met.ptUnclusteredUp
+                    met["phi"] = met.phiUnclusteredUp
+                return met
             metx = metx + met.MetUnclustEnUpDeltaX
             mety = mety + met.MetUnclustEnUpDeltaY
         elif variation == "down":
+            if nano_met_name == "PuppiMET":
+                # See comment in 'up' variation
+                if (
+                    np.any(np.isnan(met.ptUnclusteredDown))
+                    or np.any(np.isnan(met.phiUnclusteredDown))
+                ):
+                    import warnings
+                    warnings.warn(
+                        "NaN values found in PuppiMET unclustered energy "
+                        "down variation. Falling back to nominal MET for "
+                        "these events.")
+                    met["pt"] = np.where(np.isnan(met.ptUnclusteredDown),
+                                         met.pt,
+                                         met.ptUnclusteredDown
+                                         )
+                    met["phi"] = np.where(np.isnan(met.phiUnclusteredDown),
+                                          met.phi,
+                                          met.phiUnclusteredDown
+                                          )
+                else:
+                    met["pt"] = met.ptUnclusteredDown
+                    met["phi"] = met.phiUnclusteredDown
+                # TODO: reconsider this method. If PuppiMET is renamed to MET
+                # in the future, this will break.
+                # TODO: Implement JET corrections for PuppiMET
+                met["pt"] = np.where(np.isnan(met.ptUnclusteredDown), met.pt, met.ptUnclusteredDown)
+                met["phi"] = np.where(np.isnan(met.phiUnclusteredDown), met.phi, met.phiUnclusteredDown)
+                return met
             metx = metx - met.MetUnclustEnUpDeltaX
             mety = mety - met.MetUnclustEnUpDeltaY
         elif variation != "central" and variation is not None:
@@ -1075,14 +1524,15 @@ class ProcessorBasicPhysics(pepper.Processor):
                 "phi": jets.phi,
                 "mass": jets.mass,
                 "emef": jets.neEmEF + jets.chEmEF
-            }, with_name="Jet", behavior=jets.behavior)
-            lowptjets = self.build_lowptjet_column(is_mc, junc, jer, rng, data)
+            }, with_name="PtEtaPhiMLorentzVector", behavior=jets.behavior)
+            lowptjets = self.build_lowptjet_column(
+                is_mc, era, junc, jer, rng, data)
             # Cut according to MissingETRun2Corrections Twiki
             jets = jets[(jets["pt_nomuon"] > 15) & (jets["emef"] < 0.9)]
             lowptjets = lowptjets[(lowptjets["pt_nomuon"] > 15)
                                   & (lowptjets["emef"] < 0.9)]
             # lowptjets lose their type here. Probably a bug, workaround
-            lowptjets = ak.with_name(lowptjets, "Jet")
+            lowptjets = ak.with_name(lowptjets, "PtEtaPhiMLorentzVector")
             if smear_met:
                 lowptfac = lowptjets["juncfac"] * lowptjets["jerfac"] - 1
             else:
@@ -1111,13 +1561,13 @@ class ProcessorBasicPhysics(pepper.Processor):
         keep = np.full(len(data), True)
         if cut_ele:
             ele = data["Electron"]
-            keep = keep & (~self.in_hem1516(ele.phi, ele.eta).any())
+            keep = keep & (~ak.any(self.in_hem1516(ele.phi, ele.eta)))
         if cut_muon:
             muon = data["Muon"]
-            keep = keep & (~self.in_hem1516(muon.phi, muon.eta).any())
+            keep = keep & (~ak.any(self.in_hem1516(muon.phi, muon.eta)))
         if cut_jet:
             jet = data["Jet"]
-            keep = keep & (~self.in_hem1516(jet.phi, jet.eta).any())
+            keep = keep & (~ak.any(self.in_hem1516(jet.phi, jet.eta)))
         return keep
 
     def lep_pt_requirement(self, data):
@@ -1129,7 +1579,7 @@ class ProcessorBasicPhysics(pepper.Processor):
             # https://github.com/scikit-hep/awkward-1.0/issues/1305
             mask = ak.flatten(ak.num(data["Lepton"]) > i, axis=None)
             n[mask] += np.asarray(
-                pt_min < data["Lepton"].pt[mask, i]).astype(int)
+                pt_min < data["Lepton"].pt[mask][:, i]).astype(int)
         return n >= self.config["lep_pt_num_satisfied"]
 
     def good_mass_lepton_pair(self, data):
@@ -1145,6 +1595,10 @@ class ProcessorBasicPhysics(pepper.Processor):
     def has_jets(self, data):
         """Require events with minimum number of jets."""
         return self.config["num_jets_atleast"] <= ak.num(data["Jet"])
+
+    def has_fatjets(self, data):
+        """Require events with minimum number of fat jets."""
+        return self.config["num_fatjets_atleast"] <= ak.num(data["FatJet"])
 
     def compute_puid_sys(self, central, weighter, wp, eta, pt,
                          pass_puid, has_gen_jet, sf_type):
@@ -1185,8 +1639,17 @@ class ProcessorBasicPhysics(pepper.Processor):
         # This assumes jets are ordered by pt highest first
         for i, pt_min in enumerate(self.config["jet_pt_min"]):
             mask = ak.num(data["Jet"]) > i
-            n[mask] += np.asarray(pt_min < data["Jet"].pt[mask, i]).astype(int)
+            n[mask] += np.asarray(pt_min < data["Jet"].pt[mask][:, i]).astype(int)
         return n >= self.config["jet_pt_num_satisfied"]
+
+    def fatjet_pt_requirement(self, data):
+        """Require fat jets with minimum pT threshold."""
+        n = np.zeros(len(data))
+        # This assumes jets are ordered by pt highest first
+        for i, pt_min in enumerate(self.config["fatjet_pt_min"]):
+            mask = ak.num(data["FatJet"]) > i
+            n[mask] += np.asarray(pt_min < data["FatJet"].pt[mask][:, i]).astype(int)
+        return n >= self.config["fatjet_pt_num_satisfied"]
 
     def compute_btag_sys(self, central, up_name, down_name, weighter, wp, flav,
                          eta, pt, discr, efficiency):
@@ -1279,6 +1742,13 @@ class ProcessorBasicPhysics(pepper.Processor):
 
     def btag_cut(self, is_mc, data):
         """Select events with minimum number of b-tagegd jets."""
+        if self.config["btag"] == "skip":
+            if self.config["num_atleast_btagged"] == 0:
+                return np.full(len(data), True)
+            else:
+                raise RuntimeError(
+                    "Cannot apply btag cut if btag is set to 'skip'. Please remove this "
+                    "cut or choose a b-tagging algorithm.")
         num_btagged = ak.sum(data["Jet"]["btagged"], axis=1)
         accept = np.asarray(num_btagged >= self.config["num_atleast_btagged"])
         if is_mc and (
@@ -1307,8 +1777,8 @@ class ProcessorBasicPhysics(pepper.Processor):
         # make make this function faster overall
         columns = ["pt", "eta", "phi", "mass", "btagged"]
         jets = ak.with_name(data["Jet"][columns], "PtEtaPhiMLorentzVector")
-        btags = jets[data["Jet"].btagged]
-        jetsnob = jets[~data["Jet"].btagged]
+        btags = jets[jets.btagged]
+        jetsnob = jets[~jets.btagged]
         num_btags = ak.num(btags)
         b0, b1 = ak.unzip(ak.where(
             num_btags > 1, ak.combinations(btags, 2),
@@ -1366,9 +1836,6 @@ class ProcessorBasicPhysics(pepper.Processor):
                 lep, antilep, b, antib, met, mwp=mw, mwm=mw, mt=mt, mat=mt,
                 energyfl=energyfl, energyfj=energyfj, alphal=alphal,
                 alphaj=alphaj, hist_mlb=mlb, num_smear=num_smear, rng=rng)
-            return ak.concatenate([top, antitop], axis=1)
-        elif reco_alg == "betchart":
-            top, antitop = betchart(lep, antilep, b, antib, met)
             return ak.concatenate([top, antitop], axis=1)
         else:
             raise ValueError(f"Invalid value for reco algorithm: {reco_alg}")

@@ -1,32 +1,40 @@
 import os
 import abc
 from dataclasses import dataclass, fields
+import socket
 from typing import Optional
 import threading
 import queue
-from copy import deepcopy
+from copy import copy, deepcopy
 from functools import partial
 import time
 import logging
 import uproot
 import coffea.processor
 import coffea.util
-from coffea.processor import set_accumulator
-from coffea.processor.executor import (
-    _compression_wrapper, _decompress, UprootMissTreeError, FileMeta)
-from coffea.processor.accumulator import iadd as accum_iadd
+from coffea.processor import CheckpointerABC
+from coffea.processor.executor import _compression_wrapper, _decompress
+from coffea.processor.accumulator import iadd as accum_iadd, set_accumulator
 from coffea.processor import ProcessorABC
-from coffea.nanoevents import NanoEventsFactory
-import cloudpickle
-import uuid
-import lz4.frame as lz4f
+from coffea.nanoevents import schemas, NanoEventsFactory
+from coffea.nanoevents.trace import trace
+from coffea.nanoevents.mapping import BufferCache
+from collections.abc import Callable, MutableMapping
 from tqdm import tqdm
+import cloudpickle
+import lz4.frame as lz4f
+import uuid
+from numcodecs import Blosc
+import subprocess
 import pepper
 
 
-STATEFILE_VERSION = 3
+STATEFILE_VERSION = 4
+LOCALTIMEOUT = 60  # seconds
 
 logger = logging.getLogger(__name__)
+
+codec = Blosc("zstd", clevel=1, shuffle=Blosc.BITSHUFFLE)
 
 
 class StateFileError(Exception):
@@ -35,6 +43,64 @@ class StateFileError(Exception):
 
 def _wrap_execution(function, item):
     return item, function(item)
+
+
+def _get_node_info() -> str:
+    """Get information about the node this code is running on, to be used in error messages.
+    If the code is running on a cluster with slots, include the slot number in the information.
+    Example: batch1658.desy.de:slot2_71."""
+    hostname = socket.gethostname()
+    slot = os.environ.get("_CONDOR_SLOT")
+    if slot:
+        return f"{hostname}:{slot}"
+    return hostname
+
+
+def _can_open_local_within_timeout(path, timeout=LOCALTIMEOUT):
+    """Return True if a small read from ``path`` completes within ``timeout``
+    seconds, False otherwise.
+
+    Probes both the metadata and data paths of the local filesystem by
+    reading the first few bytes of the file. This detects wedged
+    FUSE/pnfs mounts - including the case where metadata responds but
+    the pool node holding the actual bytes is unreachable.
+
+    Uses the ``timeout`` command from GNU coreutils with explicit
+    SIGKILL, because a process blocked in a FUSE syscall may not
+    respond to SIGTERM. The 5-second ``--kill-after`` window gives
+    SIGTERM a chance to clean up gracefully before SIGKILL forces the
+    issue.
+    """
+    res = subprocess.run(
+        ["timeout", "--kill-after=5", str(timeout),
+         "head", "-c", "4", path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if res.returncode == 0:
+        return True
+    if res.returncode in (124, 137):
+        # 124 = SIGTERM timeout, 137 = SIGKILL after --kill-after
+        return False
+    # Any other non-zero: head failed for a non-timeout reason. Treat as "can't open"
+    logger.warning(
+        f"Probe of {path} failed (rc={res.returncode}): "
+        f"{res.stderr.decode(errors='replace').strip()}")
+    return False
+
+
+def _raise_if_cant_open_local(filepath, check_can_open_local: bool, timeout: int = LOCALTIMEOUT):
+    """Check if a local file can be opened by trying to read the first bytes.
+    If this fails within timeout, raise an OSError.
+    In case of remote files (starting with "root:") the function does nothing."""
+    if not filepath.startswith("root:") and check_can_open_local:
+        # If local file (doesn't start with "root:") and check_can_open_local
+        # we open the file and read the first bytes. If this fails within timeout
+        # raise an OSError.
+        if not _can_open_local_within_timeout(filepath, timeout=timeout):
+            msg = f"Failed to open {filepath} within {timeout}s on Node: {_get_node_info()}."
+            raise OSError(msg)
 
 
 @dataclass
@@ -278,7 +344,7 @@ class ResumableExecutor(abc.ABC, coffea.processor.executor.ExecutorBase):
             if not os.path.exists(output):
                 break
             i += 1
-        coffea.util.save(self.state, output)
+        pepper.misc.save(self.state, output)
         os.replace(output, self.state_file_name)
 
 
@@ -302,10 +368,10 @@ class ClusterExecutor(ResumableExecutor, _WithCluster):
     @staticmethod
     def get_taskname(item, i):
         if hasattr(item, "entrystart"):
-            return (f"{item.dataset[:40]}/{os.path.basename(item.filename)}/"
+            return (f"{item.dataset}/{os.path.basename(item.filename)}/"
                     f"{item.entrystart}:{item.entrystop}/chunk{i:06}")
         else:
-            return (f"{item.dataset[:40]}/{os.path.basename(item.filename)}/"
+            return (f"{item.dataset}/{os.path.basename(item.filename)}/"
                     f"/chunk{i:06}")
 
     def _submit(self, items, function):
@@ -322,8 +388,78 @@ class Runner(coffea.processor.Runner):
     other than making our own Runner. Coffea's Runner is using ``uproot.open``
     inside ``metadata_fetcher`` and ``_work_function``.
     """
+
     @staticmethod
-    def resolve_lfn(lfn, store, xrootddomain, skippaths):
+    def _resolved_filepaths_are_fresh(resolved_filepaths_time, max_age_days):
+        """Whether a ``resolved_filepaths_time`` timestamp is within
+        ``max_age_days`` (days, or ``False`` for no expiry)."""
+        if max_age_days is False:
+            return True
+        if resolved_filepaths_time is None:
+            # Missing timestamp - treat as stale rather than trust it.
+            return False
+        return (time.time() - resolved_filepaths_time) < max_age_days * 86400
+
+    @staticmethod
+    def _locate_lfn(lfn, metadata):
+        """Get raw candidate paths for ``lfn`` (local path first, then
+        XRootD locations in ``locate()`` order), unfiltered/unprioritized.
+        A non-LFN ``lfn`` is returned as ``[lfn]``.
+
+        Uses the cached ``metadata["resolved_filepaths"]`` instead of
+        calling XRootD if ``resolve_files_at_preprocess`` is set and the
+        cache is still fresh (see ``_resolved_filepaths_are_fresh``); a
+        stale cache here only skips using it for this call -
+        ``purge_stale_resolved_filepaths`` handles actually regenerating it.
+        """
+        if not lfn.startswith("cmslfn://"):
+            return [lfn]
+        if (metadata.get("resolve_files_at_preprocess", False)
+                and "resolved_filepaths" in metadata
+                and Runner._resolved_filepaths_are_fresh(
+                    metadata.get("resolved_filepaths_time"),
+                    metadata.get("resolve_files_max_age_days", 90))):
+            return metadata["resolved_filepaths"]
+        return pepper.datasets.locate_lfn(
+            lfn, metadata["store_path"], metadata["xrootddomain"],
+            metadata.get("use_eos_redirector", True))
+
+    @staticmethod
+    def _filter_and_prioritize(lfn, pfns, metadata):
+        """Apply ``url_priority``/``url_blacklist``/``local_file_blacklist``
+        to candidate paths from ``_locate_lfn``. Always applied fresh, so
+        config changes take effect even if ``pfns`` came from a cache."""
+        if lfn.startswith("cmslfn://"):
+            pfns = pepper.datasets.apply_url_priority_and_blacklist(
+                pfns, metadata["url_blacklist"], metadata.get("url_priority", None))
+        local_file_blacklist = metadata["local_file_blacklist"]
+        if metadata["xrootddomain"] is not None and local_file_blacklist is not None:
+            pfns = [p for p in pfns if p not in local_file_blacklist]
+        return pfns
+
+    @staticmethod
+    def _try_open_and_process(item, metadata, callable):
+        raw_pfns = Runner._locate_lfn(item.filename, metadata)
+        filepaths = Runner._filter_and_prioritize(item.filename, raw_pfns, metadata)
+        for filepath in filepaths:
+            # We check outside of the try-except block, because if a local file cannot be opened,
+            # we directly want to raise an error. Currently, no remote files are added to filepaths list
+            # if a local file is available.
+            _raise_if_cant_open_local(filepath, metadata["check_can_open_local"])
+            try:
+                return callable(filepath), raw_pfns
+
+            except OSError as e:
+                logger.warning(
+                    f"Got error for file {filepath}, continuing with alternative "
+                    f"file location: {e}")
+        else:
+            raise OSError(
+                "None of the file paths found for the following file could be "
+                f"processed: {item.filename}")
+
+    @staticmethod
+    def resolve_lfn(lfn, metadata):
         """Converts logical file names (LFNs) to physical file names that can
         be understood by ``uproot.open``
 
@@ -332,113 +468,51 @@ class Runner(coffea.processor.Runner):
         lfn
             If it starts with 'cmslfn://', it is interpreseted as logical file
             name, otherwise it is assumed it already is a physical file name
-        store
-            Path to the store directory for local access to the file
-        xrootddomain
-            Domain of the redirector server to find sites that offer the file
-            via XRootD
-        skippaths
-            Blacklist of physical file paths to ignore
+        metadata
+            Config metadata; see implementation for content
 
         Returns
         -------
         filepaths
             Physical file paths associated to ``lfn``
         """
-        if lfn.startswith("cmslfn://"):
-            filepaths = pepper.datasets.resolve_lfn(lfn, store, xrootddomain)
-        else:
-            filepaths = [lfn]
-        if skippaths is not None:
-            filepaths = [p for p in filepaths if p not in skippaths]
-
-        return filepaths
+        pfns = Runner._locate_lfn(lfn, metadata)
+        return Runner._filter_and_prioritize(lfn, pfns, metadata)
 
     @staticmethod
-    def metadata_fetcher(xrootdtimeout, align_clusters, item):
-        filepaths = Runner.resolve_lfn(
-            item.filename, item.metadata["store_path"],
-            item.metadata["xrootddomain"], item.metadata["skippaths"])
-        for filepath in filepaths:
-            try:
-                with uproot.open(
-                        {filepath: None}, timeout=xrootdtimeout) as file:
-                    try:
-                        tree = file[item.treename]
-                    except uproot.exceptions.KeyInFileError as e:
-                        raise UprootMissTreeError(str(e)) from e
+    def metadata_fetcher_root(xrootdtimeout, align_clusters, uproot_options, item):
+        def _work_function_inner(filepath):
+            item_file = copy(item)
+            item_file.filename = filepath
+            out_acc = coffea.processor.Runner.metadata_fetcher_root(
+                xrootdtimeout, align_clusters, uproot_options, item_file)
+            file_meta = out_acc.pop()
+            file_meta.filename = item.filename
+            out_acc.add(file_meta)
+            return out_acc
 
-                    metadata = {}
-                    if item.metadata:
-                        metadata.update(item.metadata)
-                    metadata.update({
-                        "numentries": tree.num_entries,
-                        "uuid": file.file.fUUID})
-                    if align_clusters:
-                        metadata["clusters"] = tree.common_entry_offsets()
-                    out = set_accumulator(
-                        [FileMeta(
-                            item.dataset, item.filename, item.treename,
-                            metadata)]
-                    )
-            except OSError as e:
-                logger.warning(
-                    "Got error while opening, continuing with alternative "
-                    f"file location: {e}")
-                continue
-            break
-        else:
-            raise OSError(
-                "None of the file paths found for the following file could be "
-                f"opened: {item.filename}")
-
-        return out
+        out_acc, raw_pfns = Runner._try_open_and_process(item, item.metadata, _work_function_inner)
+        # Cache raw paths for resolve_files_at_preprocess; safe to mutate,
+        # coffea gives us a fresh per-file dict here.
+        file_meta = out_acc.pop()
+        file_meta.metadata["resolved_filepaths"] = raw_pfns
+        file_meta.metadata["resolved_filepaths_time"] = time.time()
+        out_acc.add(file_meta)
+        return out_acc
 
     @staticmethod
-    def _work_function(
-        format,
-        xrootdtimeout,
-        mmap,
-        schema,
-        cache_function,
-        use_dataframes,
-        savemetrics,
+    def _open_file_context(
+        filepath,
         item,
-        processor_instance,
+        uproot_options
     ):
-        if not isinstance(processor_instance, ProcessorABC):
-            processor_instance = cloudpickle.loads(
-                lz4f.decompress(processor_instance))
-        # The ResumableExecutor might have loaded and old state, thus giving
-        # old metadata possibly before the user changed the config.
-        # Instead obtain the metadata from the processor_instance
-        metadata = processor_instance.pepperitemmetadata
 
-        filepaths = Runner.resolve_lfn(
-            item.filename, metadata["store_path"],
-            metadata["xrootddomain"], metadata["skippaths"])
+        filecontext = uproot.open(
+            {filepath: None},
+            **uproot_options
+        )
 
-        for filepath in filepaths:
-            try:
-                filecontext = uproot.open(
-                    {filepath: None},
-                    timeout=xrootdtimeout,
-                    file_handler=uproot.MemmapSource
-                    if mmap
-                    else uproot.MultithreadedFileSource,
-                )
-            except OSError as e:
-                logger.warning(
-                    "Got error while opening, continuing with alternative "
-                    f"file location: {e}")
-                continue
-            break
-        else:
-            raise OSError(
-                "None of the file paths found for the following file could be "
-                f"opened: {item.filename}")
-
-        metadata = {
+        metadata_file = {
             "dataset": item.dataset,
             "filename": filepath,
             "treename": item.treename,
@@ -449,22 +523,145 @@ class Runner(coffea.processor.Runner):
             else "",
         }
         if item.usermeta is not None:
-            metadata.update(item.usermeta)
+            metadata_file.update(item.usermeta)
 
-        materialized = []
-        with filecontext as file:
-            factory = NanoEventsFactory.from_root(
-                file=file,
-                treepath=item.treename,
-                entry_start=item.entrystart,
-                entry_stop=item.entrystop,
-                persistent_cache=cache_function(),
-                schemaclass=schema,
-                metadata=metadata,
-                access_log=materialized,
-            )
-            events = factory.events()
+        return filecontext, metadata_file
 
-            out = processor_instance.process(events)
+    @staticmethod
+    def _construct_events(file, item, schema, metadata, iteritems_options, preload=None, use_buffer_cache=True):
+        in_memory = {}
+        if use_buffer_cache:
+            buffer_cache = BufferCache(cache=in_memory, codec=codec)
+        else:
+            buffer_cache = None
+        factory = NanoEventsFactory.from_root(
+            file=file,
+            treepath=item.treename,
+            schemaclass=schema,
+            metadata=metadata,
+            mode="virtual",
+            entry_start=item.entrystart,
+            entry_stop=item.entrystop,
+            iteritems_options=iteritems_options,
+            preload=(lambda b: b.name in preload) if preload is not None else None,
+            buffer_cache=buffer_cache
+        )
+        events = factory.events()
+        return events, in_memory
 
-        return {"out": out}
+    @staticmethod
+    def _work_function(
+        format: str,
+        xrootdtimeout: int,
+        schema: schemas.BaseSchema,
+        use_dataframes: bool,
+        savemetrics: bool,
+        item: coffea.processor.executor.WorkItem,
+        processor_instance: ProcessorABC,
+        uproot_options: dict,
+        iteritems_options: dict,
+        checkpointer: CheckpointerABC,
+        cache_function: Callable[[], MutableMapping]
+    ):
+        if "timeout" not in uproot_options:
+            uproot_options["timeout"] = xrootdtimeout
+
+        if not isinstance(processor_instance, ProcessorABC):
+            processor_instance = cloudpickle.loads(
+                lz4f.decompress(processor_instance))
+
+        use_buffer_cache = item.usermeta.get("use_buffer_cache", True)
+
+        def _work_function_inner(filepath):
+            filecontext, metadata_file = Runner._open_file_context(filepath, item, uproot_options)
+
+            with filecontext as file:
+                events, buffer = Runner._construct_events(
+                    file, item, schema, metadata_file, iteritems_options, processor_instance.columns_to_preload(),
+                    use_buffer_cache=use_buffer_cache)
+                processor_instance.column_buffer_cache = buffer
+                out = processor_instance.process(events)
+            return {"out": out}
+
+        result, _ = Runner._try_open_and_process(item, item.usermeta, _work_function_inner)
+        return result
+
+    def do_type_tracing(self, fileset, processor_instance):
+        # for now: pick a random item from the fileset for tracing
+        # make sure this is MC in case there is MC (since that has more branches)
+        item_to_process = fileset[0]
+        mc_datasets = processor_instance.config["mc_datasets"]
+        files_mc = [i for i in fileset if i.dataset in mc_datasets]
+        if len(files_mc) > 0:
+            item_to_process = files_mc[0]
+        else:
+            item_to_process = fileset[0]
+
+        processor_instance = copy(processor_instance)
+        processor_instance.eventdir = None  # no event output when tracing
+        # TODO decide on whether running systs while tracing
+
+        metadata = item_to_process.usermeta
+        uproot_options = {"timeout": self.xrootdtimeout}
+
+        def _work_function_inner(filepath):
+            filecontext, metadata_file = Runner._open_file_context(filepath, item_to_process, uproot_options)
+
+            with filecontext as file:
+                events, buffer = Runner._construct_events(
+                    file, item_to_process, self.schema, metadata_file, {}, None, False)
+                necessary_columns = trace(processor_instance.process, events)
+            return necessary_columns
+
+        result, _ = Runner._try_open_and_process(item_to_process, metadata, _work_function_inner)
+        return result
+
+
+def purge_stale_resolved_filepaths(pre_executor, datasets, treename, max_age_days):
+    """Remove stale ``resolved_filepaths`` entries (older than
+    ``max_age_days``) for ``datasets``' files from ``pre_executor.state``,
+    so the next ``Runner.preprocess()`` re-fetches and re-persists them
+    instead of workers working around a stale cache forever.
+
+    Must run before ``preprocess()``: coffea only skips re-fetching a file
+    if its key is in ``state["items_done"]``, regardless of staleness, and
+    since ``FileMeta`` equality ignores ``.metadata``, a stale entry has to
+    be removed from both ``items_done`` and ``state["accumulator"]`` or a
+    freshly re-fetched one would silently fail to replace it in the set.
+    Only ``datasets``' own files are touched, so other datasets sharing the
+    same ``--metadata`` cache are left alone.
+
+    Parameters
+    ----------
+    pre_executor
+        The ``ResumableExecutor`` to use as ``pre_executor`` for preprocessing
+    datasets
+        ``{dataset: [file, file, ...]}``, same mapping about to be fed into
+        ``Runner.preprocess()``
+    treename
+        Tree name preprocessing will use
+    max_age_days
+        See ``Runner._resolved_filepaths_are_fresh``
+    """
+    accumulator = pre_executor.state.get("accumulator")
+    if not accumulator:
+        return
+    current_run_keys = {
+        coffea.processor.executor.FileMeta(dsname, filename, treename)
+        for dsname, filenames in datasets.items() for filename in filenames
+    }
+    stale = {
+        filemeta for filemeta in accumulator
+        if filemeta in current_run_keys
+        and not Runner._resolved_filepaths_are_fresh(
+            (filemeta.metadata or {}).get("resolved_filepaths_time"), max_age_days)
+    }
+    if not stale:
+        return
+    logger.info(f"Re-resolving file locations for {len(stale)} file(s) "
+                "with an expired resolved_filepaths cache")
+    pre_executor.state["accumulator"] = set_accumulator(
+        fm for fm in accumulator if fm not in stale)
+    pre_executor.state["items_done"] = [
+        item for item in pre_executor.state["items_done"] if item not in stale
+    ]

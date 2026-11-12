@@ -5,6 +5,7 @@ import sys
 import importlib
 import argparse
 import logging
+import dataclasses
 from datetime import datetime
 import shutil
 
@@ -56,8 +57,9 @@ def run_processor(processor_class=None, description=None, mconly=False):
         help="Can be specified multiple times. Ignore datasets given in "
         "config and instead process these. Can be specified multiple times.")
     parser.add_argument(
-        "--dataset", action="append", help="Only process this dataset. Can be "
-        "specified multiple times.")
+        "--dataset", action="append", help="Only process this dataset. Will "
+        "also match regex expressions, though these need to be given inside "
+        "quoted strings in the command line. Can be specified multiple times.")
     if not mconly:
         parser.add_argument(
             "--mc", action="store_true", help="Only process MC files. Ignored "
@@ -71,8 +73,12 @@ def run_processor(processor_class=None, description=None, mconly=False):
         "simultaneous jobs are submitted. The number can be changed by "
         "supplying it to this option.")
     parser.add_argument(
-        "-r", "--retries", type=int, help="Number of times to retry if there "
-        "is exception in an HTCondor job. If not given, retry infinitely.")
+        "-p", "--processes", type=int, nargs="?", help="Parallelize on the local"
+        "machine on a given number of processes."
+    )
+    parser.add_argument(
+        "-r", "--retries", default=10, type=int, help="Number of times to "
+        "retry if there is exception in an HTCondor job. Default is ten.")
     parser.add_argument(
         "--chunksize", type=int, help="Number of events to "
         "process at once. A smaller value means less memory usage. Defaults "
@@ -113,12 +119,22 @@ def run_processor(processor_class=None, description=None, mconly=False):
         "increases memory usage inside the job. Default is 1."
     )
     parser.add_argument(
-        "-m", "--memory", type=float, help="Memory in GB that is requested "
+        "-m", "--memory", type=float, help="Memory in GiB that is requested "
         "per condor worker. If a worker exceeds the limit, condor might "
         " kill it. Default is 2.", default=2.0)
     parser.add_argument(
+        "--runtime", type=float, help="Runtime in hours that a condor job "
+        "is allowd to take. Note that jobs that exceed the runtime and are "
+        "killed will still be resubmitted. Default is 3.", default=3.0)
+    parser.add_argument(
         "--condorlogdir", help="Directory to store stdout and stderr logs "
         "running on HTCondor. Default is pepper_logs", default="pepper_logs")
+    parser.add_argument(
+        "--dasklogs",
+        action="store_true",
+        help="Flag to enable logging of output from dask_jobqueue. "
+        "Enabling this might help with debugging condor issues, but leads "
+        "to very verbose output in the console.")
     parser.add_argument(
         "--metadata", help="File to cache metadata in. This allows speeding "
         "up or skipping the preprocessing step. Default is "
@@ -142,7 +158,16 @@ def run_processor(processor_class=None, description=None, mconly=False):
         "pointed to by --statedata exists, load the file and resume from that "
         "state"
     )
+    parser.add_argument(
+        "-t", "--trace", action="store_true",
+        help="Trace column usage in the processor to determine which "
+        "columns to preload. This can speed up processing especially for xrootd "
+        "input, but increases memory usage."
+    )
     args = parser.parse_args()
+
+    if args.condor and args.processes:
+        sys.exit("Cannot give --condor and --processes at the same time")
 
     logger = logging.getLogger("pepper")
     logger.addHandler(logging.StreamHandler())
@@ -263,14 +288,22 @@ def run_processor(processor_class=None, description=None, mconly=False):
 
     datasets = processor.preprocess(datasets)
     if args.condor is not None:
-        pepper.htcondor.Cluster.set_global_config()
+        pepper.htcondor.Cluster.set_global_config(dasklogs=args.dasklogs)
+    if "exit_on_failed_jobs" in config:
+        exit_on_failed_jobs = config["exit_on_failed_jobs"].lower()
+    else:
+        exit_on_failed_jobs = "all"
     cluster = pepper.htcondor.Cluster(
-        args.condor,
+        args.processes if args.processes is not None else args.condor,
         condorsubmitfile=args.condorsubmit,
         condorinit=args.condorinit,
         retries=args.retries,
-        logdir=args.condorlogdir,
-        memory=str(args.memory) + " GB"
+        exit_on_failed_jobs=exit_on_failed_jobs,
+        mc_dsnames=list(config["mc_datasets"].keys()),
+        logdir=os.path.realpath(args.condorlogdir),
+        memory=str(args.memory) + " GiB",
+        runtime=int(args.runtime*60*60),
+        use_local=args.processes is not None
     )
     pre_executor = pepper.executor.ClusterExecutor(
         state_file_name=args.metadata,
@@ -316,17 +349,64 @@ def run_processor(processor_class=None, description=None, mconly=False):
     xrootddomain = None
     if "file_mode" in config and "xrootd" in config["file_mode"]:
         xrootddomain = config["xrootddomain"]
-    bad_file_paths = None
-    if "bad_file_paths" in config:
-        bad_file_paths = config["bad_file_paths"]
+    local_file_blacklist = None
+    if "local_file_blacklist" in config \
+            and config["file_mode"] == "local+xrootd":
+        local_file_blacklist = config["local_file_blacklist"]
+    xrootd_url_blacklist = None
+    if "xrootd_url_blacklist" in config:
+        xrootd_url_blacklist = config["xrootd_url_blacklist"]
+    check_can_open_local = config.get("check_can_open_local_files", False)
+    use_eos_redirector = config.get("use_eos_redirector", True)
+    xrootd_url_priority = config.get("xrootd_url_priority", None)
+    use_buffer_cache = config.get("use_buffer_cache", True)
+    resolve_files_at_preprocess = config.get("resolve_files_at_preprocess", False)
+    resolve_files_max_age_days = config.get("resolve_files_max_age_days", 90)
     metadata = {"store_path": store, "xrootddomain": xrootddomain,
-                "skippaths": bad_file_paths}
-    # Give metadata for the processing step
-    processor.pepperitemmetadata = metadata
+                "local_file_blacklist": local_file_blacklist,
+                "url_blacklist": xrootd_url_blacklist,
+                "use_eos_redirector": use_eos_redirector,
+                "url_priority": xrootd_url_priority,
+                "use_buffer_cache": use_buffer_cache,
+                "check_can_open_local": check_can_open_local,
+                "resolve_files_at_preprocess": resolve_files_at_preprocess,
+                "resolve_files_max_age_days": resolve_files_max_age_days
+                }
+
+    if resolve_files_at_preprocess:
+        # Re-fetch and re-persist any expired resolved_filepaths entries.
+        pepper.executor.purge_stale_resolved_filepaths(
+            pre_executor, datasets, "Events", resolve_files_max_age_days)
+
     # For the preprocessing step, add metadata also to the file meta
     datasets = {k: {"files": v, "metadata": metadata}
                 for k, v in datasets.items()}
-    output = runner(datasets, "Events", processor)
+    preprocess_output = runner.preprocess(datasets, treename="Events")
+    # Refresh WorkItem metadata from config, but keep each item's own
+    # resolved_filepaths/resolved_filepaths_time from preprocessing.
+    new_preprocess_output = []
+    for item in preprocess_output:
+        usermeta = dict(metadata)
+        if item.usermeta and "resolved_filepaths" in item.usermeta:
+            usermeta["resolved_filepaths"] = item.usermeta["resolved_filepaths"]
+        if item.usermeta and "resolved_filepaths_time" in item.usermeta:
+            usermeta["resolved_filepaths_time"] = item.usermeta["resolved_filepaths_time"]
+        new_preprocess_output.append(dataclasses.replace(item, usermeta=usermeta))
+    preprocess_output = new_preprocess_output
+
+    if args.trace:
+        logger.info("Tracing columns to preload...")
+        column_tracing_result = runner.do_type_tracing(preprocess_output, processor)
+        if len(column_tracing_result) > 0:
+            processor.column_tracing_result = column_tracing_result
+            columns_to_preload = processor.columns_to_preload()
+            logger.warning(f"Will preload {len(columns_to_preload)} columns.")
+            logger.debug("Columns that will be preloaded:")
+            logger.debug("\n".join(sorted(columns_to_preload)))
+        else:
+            logger.warning("Column tracing failed. Will continue without preloading")
+
+    output = runner(preprocess_output, processor, treename="Events")
     processor.save_output(output, args.output)
     if args.eventdir is not None:
         print("If there were errors, please make sure to run "

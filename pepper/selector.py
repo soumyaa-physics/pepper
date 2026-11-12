@@ -3,7 +3,6 @@ import awkward as ak
 from collections import defaultdict
 import logging
 from copy import copy
-import pepper.misc
 
 
 logger = logging.getLogger(__name__)
@@ -21,7 +20,7 @@ class Selection:
     """
     def __init__(self):
         self.names = []
-        self.cuts = ak.Array({})
+        self.cuts = None
 
     def all(self, names=None):
         """Get the product of all cuts' weights
@@ -57,13 +56,16 @@ class Selection:
             Array whether an event passes a cut. Unweighted cuts can be
             specified as bools and weighted cuts as floats
         """
-        self.cuts[name] = accept
+        if self.cuts is None:
+            self.cuts = ak.Array({name: accept})
+        else:
+            self.cuts[name] = accept
         self.names.append(name)
 
     def clear(self):
         """Remove all cuts from the selection"""
         self.names = []
-        self.cuts = ak.Array({})
+        self.cuts = None
 
     def __len__(self):
         """Number of cuts"""
@@ -105,7 +107,7 @@ class Selector:
     """
 
     def __init__(self, data, weight=None, on_update=None, applying_cuts=True,
-                 rng_seed=None):
+                 rng_seed=None, output_filler=None):
         """
         Parameters
         ----------
@@ -125,6 +127,9 @@ class Selector:
             int or tuple of ints to seed the random number generator
             with. If ``None``, a random seed will be used. For details
             see the parameter of ``numpy.random.default_rng()``.
+        output_filler
+            A direct link to the output_filler, currently only used to
+            access the accumulators for normalisation of systematics
         """
         self.data = data
         if hasattr(self.data, "metadata"):
@@ -148,6 +153,7 @@ class Selector:
 
         self.rng = np.random.default_rng(rng_seed)
         self.cats = {}
+        self.filler = output_filler
 
         self._applying_cuts = True
         self.add_cut("BeforeCuts", np.full(self.num, True))
@@ -204,21 +210,49 @@ class Selector:
         else:
             return ak.sum(self.unapplied_product != 0)
 
-    def set_cat(self, name, categories):
-        """Set a categorization
+    def set_cat(self, name, categories, safe=True):
+        """Set a categorisation
 
-        A categorization is for example the decay channel of an event.
-        Categories inside this categorization would be the ee-decay or the
+        A categorisation is for example the decay channel of an event.
+        Categories inside this categorisation would be the ee-decay or the
         µµ-decay.
 
         Parameters
         ----------
         name
-            Name of the categorization
+            Name of the categorisation
         categories
-            Categories inside the categorization. Each category must also be
+            Categories inside the categorisation. Each category must also be
             a field in ``data``
+        safe --  Boolean on whether to check if all events belong to exactly
+                 one category. Note that if this is not satisfied, the
+                 cutflows will be incorrect, as will histograms when
+                 integrating over the category axis, as events will either be
+                 silently cut away (if not included in any catgories) or
+                 double counted (if appearing in multiple categories)
         """
+        logger.info(
+            f"Setting categorisation '{name}' with categories: {categories}")
+        selected = np.zeros(len(self.data), dtype=int)
+        for cat in categories:
+            if ak.any(ak.is_none(self.data[cat])):
+                logger.warn(
+                    f"Category '{cat}' contains 'None' values. Assuming "
+                    f"this is a subcategory and setting these to False.")
+                self.data[cat] = ak.fill_none(self.data[cat], False)
+            selected = selected + self.data[cat]
+        if safe and not ak.all(selected == 1):
+            raise ValueError(
+                "Not all events fit into exactly one category")
+        for cat_name, exist_categories in self.cats.items():
+            if cat_name == name:
+                logger.warn(
+                    f"Warning! Overwriting existing categorisation '{name}'.")
+            elif exist_categories & categories:
+                raise ValueError(
+                    f"The following category(s) are already used in "
+                    f"a previous categorisation, please rename: "
+                    f"{exist_categories & categories}")
         self.cats[name] = categories
 
     def _invoke_callbacks(self):
@@ -327,15 +361,15 @@ class Selector:
                 values = []
                 n = self.num
                 for value_old in values_old:
+                    if not isinstance(value_old, np.ndarray):
+                        value_old = np.array(value_old)
                     if categories is not None:
                         value_old = pad_cats(cats_mask, value_old)
                     if len(value_old) != n:
                         if self.applying_cuts:
                             value = value_old[accept]
                         else:
-                            value = np.empty(n)
-                            value[accept] = value_old
-                            value = ak.mask(value, accept)
+                            value = pad_cats(accept, value_old)
                     elif not self.applying_cuts:
                         value = ak.mask(value_old, accept)
                     else:
@@ -358,7 +392,8 @@ class Selector:
             self.systematics = self.systematics[mask]
         self.unapplied_cuts.clear()
 
-    def set_systematic(self, name, *values, scheme=None, cut=None):
+    def set_systematic(self, name, *values, scheme=None, cut=None,
+                       norm_post=False):
         """Set the systematic weights for an uncertainty. These will be
         found in the `self.systematics`.
 
@@ -389,6 +424,10 @@ class Selector:
             Name of the cut after which the systematic needs to be accounted
             for. If not None, a corresponding item will be found in
             ``self.cut_systematic_map``
+        norm_post
+            Boolean for whether this systematic should be normailsed at the end
+            of the run, will fill the sumw into the output filler, triggering
+            normalisation when saving histograms
         """
 
         if name == "weight":
@@ -412,9 +451,24 @@ class Selector:
             raise ValueError("scheme needs to be either 'updown', 'numeric',"
                              f"'single' or None, got {scheme}")
         for name, value in zip(names, values):
+            if not isinstance(value, np.ndarray):
+                value = np.array(value)
+            if value.ndim != 1:
+                raise ValueError("Systematics must be flat 1-d arrays!")
             self.systematics[name] = value
             if cut is not None:
                 self.cut_systematic_map[cut].append(name)
+        if norm_post:
+            if len(self.cutnames) > 1:
+                raise RuntimeError(
+                    "Systematics to be normed should be set before any cuts "
+                    "to account for acceptance cuts. Please move the call "
+                    "to selector.systematic earlier in your processor")
+            if self.filler is None:
+                raise UnboundLocalError(
+                    "A call was made to selctor.set_systematic with "
+                    "norm_post=True, but no filler was set for this selector")
+            self.filler.add_sumws_for_norm(self.systematics, names)
 
     def _mask(self, column, mask):
         num_events = ak.sum(mask)
@@ -427,7 +481,7 @@ class Selector:
             return ak.pad_none(column, len(mask), axis=0)
 
     def set_column(self, column_name, column, all_cuts=False,
-                   no_callback=False, lazy=False, categories=None):
+                   no_callback=False, categories=None):
         """Sets a column of ``self.data``
 
         Parameters
@@ -443,10 +497,6 @@ class Selector:
         no_callback
             Whether not to call the callbacks. These callbacks usually fill
             histograms etc.
-        lazy
-            If True, column must be a callable and the column will be
-            inserted as a virtual array, making the callable only called
-            when the data array determines it has to.
         categories
             If not ``None``, ignore events that are not part of any of
             the specified categorizations. This is done by specifying
@@ -457,8 +507,7 @@ class Selector:
             categorization if any of the fields are ``True``.
         """
 
-        logger.info(
-            f"Setting column {column_name}" + (" lazily" if lazy else ""))
+        logger.info(f"Setting column {column_name}")
         if all_cuts and not self.applying_cuts:
             data = self.final
             mask = ~ak.is_none(data)
@@ -472,24 +521,14 @@ class Selector:
             data = data[cats_mask]
 
         if callable(column):
-            if lazy:
-                column = pepper.misc.VirtualArrayCopier(data).wrap_with_copy(
-                    column)
-                column = ak.virtual(column, cache={}, length=len(data))
-            else:
-                column = column(data)
+            column = column(data)
         if column is None:
             raise ValueError("column content must be an array, not None")
         if categories is not None:
             column = self._mask(column, cats_mask)
         if mask is not None:
             column = self._mask(column, mask)
-        if lazy:
-            data_copier = pepper.misc.VirtualArrayCopier(self.data)
-            data_copier[column_name] = column
-            self.data = data_copier.get()
-        else:
-            self.data[column_name] = column
+        self.data[column_name] = column
         self.done_steps.add("column:" + column_name)
         if not no_callback:
             self._invoke_callbacks()
@@ -547,8 +586,8 @@ class Selector:
         work with the copy without modifying the original"""
         s = self.__class__.__new__(self.__class__)
         s.__dict__.update(self.__dict__)
-        # copy(self.data) loads all fields. Workaround
-        s.data = pepper.misc.VirtualArrayCopier(self.data).get()
+        # for ak2, copy(self.data) seems to work without overhead, unlike ak1
+        s.data = copy(self.data)
         if self.systematics is not None:
             s.systematics = copy(self.systematics)
         s.cutnames = copy(self.cutnames)

@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 
+import abc
+from collections.abc import Mapping
 import numpy as np
 import coffea
 from coffea.lookup_tools.extractor import file_converters
 from coffea.btag_tools import BTagScaleFactor
 import awkward as ak
 import correctionlib
-from collections import namedtuple
 from functools import partial
+from itertools import islice
 import warnings
 import logging
 
-from pepper.misc import onedimeval
-
+from pepper.misc import onedimeval, LHCRun, get_run_for_year
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +98,7 @@ class ScaleFactors:
             factors[tuple([slice(None)] * i + [slice(-1, None)])] = value
 
     @classmethod
-    def from_hist(cls, hist, dimlabels=None, setoverflow=True):
+    def from_hist(cls, hist, dimlabels=None):
         """Create a new instance from a histogram
 
         This uses the variances found in the histogram as up/down variations.
@@ -123,12 +125,11 @@ class ScaleFactors:
                 f"Got {len(edges)} dimensions but {len(dimlabels)} labels")
         # Set overflow bins to 1 so that events outside the histogram
         # get scaled by 1
-        if setoverflow:
-            cls._setoverflow(factors, 1)
-            if factors_up is not None:
-                cls._setoverflow(factors_up, 1)
-            if factors_down is not None:
-                cls._setoverflow(factors_down, 1)
+        cls._setoverflow(factors, 1)
+        if factors_up is not None:
+            cls._setoverflow(factors_up, 1)
+        if factors_down is not None:
+            cls._setoverflow(factors_down, 1)
         bins = dict(zip(dimlabels, edges))
         return cls(factors, factors_up, factors_down, bins)
 
@@ -151,7 +152,7 @@ class ScaleFactors:
                 return [get_factors(depth-1, h) for h in hists]
 
         tmp_hists = hists
-        for i, k in enumerate(kwargs):
+        for _i, _k in enumerate(kwargs):
             tmp_hists = tmp_hists[0]
         hist_edges = list(tmp_hists.to_numpy(flow=True)[1:])
         edges = list(kwargs.values()) + hist_edges
@@ -205,12 +206,12 @@ class ScaleFactors:
             try:
                 val = kwargs[key]
             except KeyError:
-                raise ValueError("Scale factor depends on \"{}\" but no such "
-                                 "argument was not provided"
-                                 .format(key))
+                raise ValueError(
+                    f"Scale factor depends on \"{key}\" but no such "
+                    f"argument was not provided")
             if isinstance(val, ak.Array):
                 counts = []
-                for i in range(val.ndim - 1):
+                for _i in range(val.ndim - 1):
                     counts.append(ak.num(val))
                     val = ak.flatten(val)
                 val = np.asarray(val)
@@ -225,6 +226,153 @@ class ScaleFactors:
     def dimlabels(self):
         """The names of the variables the scale factor depends on"""
         return self._bins.keys()
+
+
+class CorrLibSFs:
+    def __init__(self, sysnaming, jsonfile, corrname, add_args):
+        """Create a thin wrapper around a single correctionlib correction.
+
+        This object extracts the named correction from a correctionlib
+        CorrectionSet (either provided directly or loaded from a JSON file)
+        and records the expected input names so the correction can be
+        evaluated later using the `__call__` method.
+
+        Parameters
+        ----------
+        sysnaming
+            Mapping from variation name (e.g. "central", "up", "down") to
+            the value that should be supplied for correction inputs named
+            "ValType", "scale_factors", "weights" or "systematic". The
+            mapped value is inserted automatically based on the requested
+            variation when evaluating the correction.
+        jsonfile
+            Either a path to a correctionlib JSON file or a
+            ``correctionlib.CorrectionSet`` instance containing the
+            corrections. If a filename is given the correction set will be
+            loaded from that file.
+        corrname
+            The name of the correction within the correction set to use.
+        add_args
+            Optional dict of additional fixed arguments to pass to the
+            correction. If the value for a given input name is a Mapping,
+            it is interpreted as a set of "correction ranges" mapping a
+            correction key to a (low, high) pair; these ranges are used by
+            ``__call__`` to evaluate different correction keys over
+            disjoint ranges (e.g. different pt bins). Otherwise the value
+            is passed directly as the input for that parameter.
+        """
+        self.corrname = corrname
+        if isinstance(jsonfile, correctionlib.CorrectionSet):
+            try:
+                self.corrset = jsonfile[corrname]
+            except IndexError as e:
+                raise ValueError(
+                    f"Correction '{corrname}' not found in file "
+                    f"'{jsonfile}'") from e
+        elif isinstance(jsonfile, str):
+            self.corrset = self._read_correctionfile(jsonfile, corrname)
+        else:
+            raise ValueError(f"Invalid correctionlib file: {jsonfile}")
+        self.names = [i.name for i in self.corrset.inputs]
+        self.add_args = add_args
+        self.sysnaming = sysnaming
+
+    @staticmethod
+    def _read_correctionfile(jsonfile, corrname):
+        try:
+            corrset = correctionlib.CorrectionSet.from_file(jsonfile)[corrname]
+        except IndexError as e:
+            raise ValueError(
+                f"Correction '{corrname}' not found in file "
+                f"'{jsonfile}'") from e
+        return corrset
+
+    def __repr__(self) -> str:
+        return f"CorrLibSFs(corrname={self.corrname})"
+
+    def __call__(self, variation="central", **kwargs):
+        """Evaluate the scale factor
+
+        Parameters
+        ----------
+        variation
+            Direction of the systematic variation. One of "central", "up"
+            or "down"
+        **kwargs
+            The parameters the scale factor depends on. For example
+            the pt, eta and so on.
+
+        Returns
+        -------
+            Array of scale factors
+        """
+        if variation not in ("central", "up", "down"):
+            raise ValueError("variation must be one of 'central', 'up', "
+                             "'down'")
+        arrays = dict()  # Since python 3.7 dicts are ordered
+        output_like = None
+        correction_ranges = []
+        correction_ranges_arg_idx = -1
+        for i, in_name in enumerate(self.names):
+            if in_name in ["ValType", "scale_factors", "weights", "systematic"]:
+                arrays[in_name] = self.sysnaming[variation]
+            elif in_name in self.add_args:
+                # Check if arg is a mapping
+                if isinstance(self.add_args[in_name], Mapping):
+                    # Save the argument index of the correction ranges. ie
+                    # what index to put the argument when calling evaluate.
+                    correction_ranges_arg_idx = i
+                    # Insert all correction ranges into the arrays
+                    for corr, (low, high) in self.add_args[in_name].items():
+                        correction_ranges.append(
+                                (corr, float(low), float(high)))
+                else:
+                    arrays[in_name] = self.add_args[in_name]
+            elif in_name in kwargs:
+                arrays[in_name] = kwargs[in_name]
+                output_like = i
+            else:
+                raise ValueError(
+                    f"Scale factor depends on \"{in_name}\" but no such "
+                    f"argument was not provided")
+        if correction_ranges_arg_idx == -1:
+            # No correction ranges were provided, so we can just evaluate
+            # the scale factor
+            return onedimeval(self.corrset.evaluate, *arrays.values(),
+                              output_like=output_like)
+        counts = ak.num(arrays["pt"])
+        flattened_arrays = dict()  # Since python 3.7 dicts are ordered
+        for key, arr in arrays.items():
+            if isinstance(arr, str):
+                flattened_arrays[key] = arr
+            else:
+                flattened = arr
+                for _i in range(flattened.ndim - 1):
+                    flattened = ak.flatten(flattened)
+                flattened_arrays[key] = np.asarray(flattened)
+        pt = flattened_arrays["pt"]
+        result = np.empty_like(pt, dtype=np.float64)
+        for key, low, high in correction_ranges:
+            mask = (low <= pt) & (pt < high)
+            if not np.any(mask):
+                continue
+            eval_args = list(flattened_arrays.values())
+            # Only use masked data for all input arrays i.e. mask non-strings
+            for i, arr in enumerate(flattened_arrays.values()):
+                if isinstance(arr, np.ndarray):
+                    eval_args[i] = arr[mask]
+            # Insert the correction range key at the correct position
+            eval_args.insert(correction_ranges_arg_idx, key)
+            chunk_result = self.corrset.evaluate(*eval_args)
+            result[mask] = chunk_result
+        return ak.unflatten(result, counts)
+
+    @property
+    def dimlabels(self):
+        """The names of the variables the scale factor depends on"""
+        return [in_name for in_name in self.names if (
+                (in_name not in ["ValType", "scale_factors"])
+                and in_name not in self.add_args)]
 
 
 class MuonScaleFactor:
@@ -280,40 +428,42 @@ class MuonScaleFactor:
         return self.nominal.dimlabels
 
 
-WpTuple = namedtuple("WpTuple", ("loose", "medium", "tight"))
-"""Working points for the b tagging"""
+class BTagWPs:
+    """A helper class to access b-tagging working points
 
+    Attributes
+    ----------
+    name
+        The name of the tagger (with appropriate capitilsation)
+    """
+    def __init__(self, wp_dict, tagger, year):
+        """
+        Parameters
+        ----------
+        wp_dict
+            A dicitonary defining for each tagger the name (with appropriate
+            capitilsation), the available working points, and the values
+        tagger
+            Name of the tagger, for example "deepCSV" or "deepJet".
+            Case insensitive
+        year
+            Year of the data
+        """
+        self.wps = wp_dict[tagger]["wps"][year]
+        # Slice the wpnames to the number of wps available for this year
+        self.wpnames = dict(islice(
+            wp_dict[tagger]["wpnames"].items(), len(self.wps)))
+        self.name = wp_dict[tagger]["name"]
 
-BTAG_WP_CUTS = {
-    "deepcsv": {
-        "2016": WpTuple(0.2217,  0.6321,  0.8953),
-        "2017": WpTuple(0.1522,  0.4941,  0.8001),
-        "2018": WpTuple(0.1241,  0.4184,  0.7527),
-        "2024": WpTuple(0.1241,  0.4184,  0.7527),
-        "ul2016pre": WpTuple(0.2027, 0.6001, 0.8819),
-        "ul2016post": WpTuple(0.1918, 0.5847, 0.8767),
-        "ul2017": WpTuple(0.1355, 0.4506, 0.7738),
-        "ul2018": WpTuple(0.1208, 0.4168, 0.7665),
-    },
-    "deepjet": {
-        "2016": WpTuple(0.0614,  0.3093,  0.7221),
-        "2017": WpTuple(0.0521,  0.3033,  0.7489),
-        "2018": WpTuple(0.0494,  0.2770,  0.7264),
-        "2024": WpTuple(0.0494,  0.2770,  0.7264),
-        "ul2016pre": WpTuple(0.0508, 0.2598, 0.6502),
-        "ul2016post": WpTuple(0.048, 0.2489, 0.6377),
-        "ul2017": WpTuple(0.0532, 0.3040, 0.7476),
-        "ul2018": WpTuple(0.0490, 0.2783, 0.7100),
-    }
-}
-"""Working points for the b tagging by year"""
-
-
-BTAG_TAGGER_NAMES = {
-    "deepcsv": "deepCSV",
-    "deepjet": "deepJet"
-}
-"""tagger names with capitalization as it appears in the correction JSON"""
+    def __call__(self, wp):
+        wp = wp.lower()
+        if wp not in self.wpnames.keys():
+            raise ValueError(f"IInvalid value for b-tag WP. Expected one of "
+                             f"{list(self.wpnames.keys())}")
+        wp_idx = list(self.wpnames.keys()).index(wp)
+        wp_val = self.wps[wp_idx]
+        wp_letter = self.wpnames[wp].upper()
+        return wp_letter, wp_idx, wp_val
 
 
 class BTagWeighter:
@@ -327,7 +477,7 @@ class BTagWeighter:
     sources
         List of uncertainty sources available
     """
-    def __init__(self, sf_filename, eff_filename, tagger, year,
+    def __init__(self, sf_filename, eff_filename, tagger, year, wps,
                  method="fixedwp", meastype="mujets", ignore_missing=False):
         """
         Parameters
@@ -339,10 +489,13 @@ class BTagWeighter:
             In Pepper the file can be generated by the
             generate_btag_efficiencies.py script
         tagger
-            Name of the tagger. Usually "deepCSV" or "deepJet".
+            Name of the tagger, for example "deepCSV" or "deepJet".
             Case insensitive
         year
             Year of the data
+        wps
+            A BTagWPs object defining the wps for this tagger and year, and
+            the name of the tagger (with appropriate capitilsation)
         method
             Method to use, eithwe "fixedwp" or "iterativefit". "fixedwp" is
             used when the analysis is using one of the POG defined working
@@ -386,9 +539,12 @@ class BTagWeighter:
             if method == "fixedwp":
                 self.eff_evaluator = get_evaluator(eff_filename)
                 correset = correctionlib.CorrectionSet.from_file(sf_filename)
-                tagger_json = BTAG_TAGGER_NAMES[tagger]
-                self.sf = [correset[f"{tagger_json}_{meastype}"],
-                           correset[f"{tagger_json}_incl"]]
+                if get_run_for_year(year) == LHCRun.Run3:
+                    self.sf = [correset[f"{wps.name}_{meastype}"],
+                               correset[f"{wps.name}_light"]]
+                else:
+                    self.sf = [correset[f"{wps.name}_{meastype}"],
+                               correset[f"{wps.name}_incl"]]
             else:
                 raise NotImplementedError(
                     "iterativefit with json format is not implemented")
@@ -401,26 +557,17 @@ class BTagWeighter:
                             "qcdscale", "statistic", "topmass", "type3"]
         else:
             self.sources = ["correlated", "uncorrelated"]
-        self.wps = BTAG_WP_CUTS[tagger][year]
+        self.wps = wps
         self.ignore_missing = ignore_missing
 
     def _fixedwp(self, wp, jf, eta, pt, discr, variation, efficiency):
         if isinstance(wp, str):
-            wp = wp.lower()
-            if wp == "loose":
-                wp = 0
-            elif wp == "medium":
-                wp = 1
-            elif wp == "tight":
-                wp = 2
-            else:
-                raise ValueError("Invalid value for wp. Expected 'loose', "
-                                 "'medium' or 'tight'")
+            _, wp, wp_val = self.wps(wp)
         elif not isinstance(wp, int):
             raise TypeError(f"Expected int or str for wp, got {wp}")
-        elif wp > 2:
-            raise ValueError(
-                f"Expected value between 0 and 2 for wp, got {wp}")
+        elif wp > len(self.wps):
+            raise ValueError(f"Expected value between 0 and {len(self.wps)} "
+                             f"for wp, got {wp}")
         possible_variations = (
             "central", "light up", "light down", "heavy up", "heavy down",
             "light up_correlated", "light up_uncorrelated",
@@ -448,7 +595,7 @@ class BTagWeighter:
 
         eff = self.eff_evaluator[efficiency](jf, pt, abs(eta))
         sfeff = sf * eff
-        is_tagged = discr > self.wps[wp]
+        is_tagged = discr > wp_val
 
         p_mc = ak.prod(eff[is_tagged], axis=1) * ak.prod(
             (1 - eff)[~is_tagged], axis=1)
@@ -470,18 +617,7 @@ class BTagWeighter:
                 light_vari, wp, jf[is_light], abseta[is_light], pt[is_light])
             return sf
 
-        wp = wp.lower()
-        wp_val = getattr(self.wps, wp)
-        if wp == "loose":
-            wp = "l"
-        elif wp == "medium":
-            wp = "m"
-        elif wp == "tight":
-            wp = "t"
-        else:
-            raise ValueError("Invalid value for wp. Expected 'loose', "
-                             "'medium' or 'tight'")
-        wp = wp.upper()
+        wp, _, wp_val = self.wps(wp)
         light_vari = "central"
         heavy_vari = "central"
         if variation != "central":
@@ -775,14 +911,14 @@ class PileupWeighter:
             raise ValueError(
                 "Missing up/down or central weights for some datasets")
 
-    def __call__(self, dsname, ntrueint, variation="central"):
+    def __call__(self, dsname, NumTrueInteractions, variation="central"):  # noqa: N803
         """Compute the weights for given events
 
         Parameters
         ----------
         dsname
             Name of the data set
-        ntrueint
+        NumTrueInteractions
             Number of true pileup per event. Pileup_ntrueint in NanoAOD
 
         Returns
@@ -795,11 +931,11 @@ class PileupWeighter:
         else:
             key = dsname
         if variation == "up":
-            return self.up[key](ntrueint=ntrueint)
+            return self.up[key](ntrueint=NumTrueInteractions)
         elif variation == "down":
-            return self.down[key](ntrueint=ntrueint)
+            return self.down[key](ntrueint=NumTrueInteractions)
         elif variation == "central":
-            return self.central[key](ntrueint=ntrueint)
+            return self.central[key](ntrueint=NumTrueInteractions)
         else:
             raise ValueError("variation must be either 'up', 'down' or "
                              f"'central', not {variation}")
@@ -878,32 +1014,195 @@ class TopPtWeigter:
         antisf = self.sffunc(antitoppt)
         return np.sqrt(sf * antisf) * self.scale
 
-class TauScaleFactors:
-    """ Tau id efficiency scale factors according to
-    https://gitlab.cern.ch/cms-nanoAOD/jsonpog-integration/-/tree/master/POG/TAU?ref_type=heads
-    """
-    def __init__(self, filepath, tau_id, wp_VSjet, wp_VSe, sfs_type):
+
+class JetCorrectionAdapterBase(abc.ABC):
+    """Base adapter for jet corrections"""
+
+    @abc.abstractmethod
+    def __call__(self, **kwargs):
+        pass
+
+
+class LegacyJetAdapter(JetCorrectionAdapterBase):
+    """Generic adapter for legacy coffea jetmet_tools objects"""
+    def __init__(self, legacy_obj, method_name):
         """
+        Args:
+            legacy_obj: The coffea jetmet_tools object
+            method_name: Name of method to call (e.g., 'getCorrection', 'getUncertainty')
+        """
+        self.legacy_obj = legacy_obj
+        self.method = getattr(legacy_obj, method_name)
+
+    @property
+    def levels(self):
+        return self.legacy_obj.levels
+
+    def __call__(self, **kwargs):
+        return self.method(**kwargs)
+
+
+class CorrectionlibAdapter(JetCorrectionAdapterBase):
+    """
+    Generic adapter for correctionlib corrections.
+    Passes kwargs directly to correctionlib evaluate().
+    """
+
+    def __init__(self, path, correction_name: str, sysnaming={
+            "central": "nom", "up": "up", "down": "down"},
+            is_uncertainty: bool = False):
+        """
+        Args:
+            cset: CorrectionSet from correctionlib
+            correction_name: Correction name (str) or empty string/None
+        """
+        self.path = path
+        self._is_uncertainty = is_uncertainty
+        # Only allow exactly one correction_name
+        if not isinstance(correction_name, str):
+            msg = f"'correction_name' must be a string, got {type(correction_name)}."
+            raise ValueError(msg)
+        self.correction_name = correction_name
+        # Create CorrLibSFs wrapper
+        self.corr = CorrLibSFs(sysnaming, path, self.correction_name, {})
+
+    def __call__(self, **kwargs):
+        """Pass kwargs directly to correctionlib evaluate()"""
+        if self.corr is None:
+            # Return trivial result for empty correction
+            if self._is_uncertainty:
+                return 0.0
+            else:
+                return 1.0
+        # Broadcast to match all array types.
+        # Separate arrays from non-arrays while preserving order
+        # Slightly involved, but we want to maintain original ordering of kwargs
+        array_keys = [k for k, v in kwargs.items() if isinstance(v, (ak.Array, np.ndarray))]
+        array_values = [kwargs[k] for k in array_keys]
+
+        # Broadcast only the arrays
+        if array_values:
+            broadcasted = dict(zip(array_keys, ak.broadcast_arrays(*array_values)))
+
+            # Rebuild kwargs in original order
+            kwargs = {k: broadcasted.get(k, v) for k, v in kwargs.items()}
+        return self.corr(**kwargs)
+
+
+class CorrectionlibCompoundAdapter(JetCorrectionAdapterBase):
+    """
+    Adapter for compound corrections (JEC only).
+    Applies multiple corrections sequentially: L1 * L2 * L3 * ...
+    """
+
+    def __init__(self, path, correction_names: str | list[str], sysnaming={
+            "central": "sf", "up": "sfup", "down": "sfdown"}):
+        """
+        Args:
+            cset: CorrectionSet from correctionlib
+            correction_names: Single name (str) or list of names to apply sequentially
+        """
+        self.path = path
+
+        # Normalize to list
+        if isinstance(correction_names, str):
+            self.correction_names = [correction_names] if correction_names else []
+        else:
+            self.correction_names = correction_names if correction_names else []
+
+        # Create CorrLibSFs wrappers for each correction
+        self.corrections = {}
+        for name in self.correction_names:
+            if name:
+                try:
+                    corr = CorrLibSFs(sysnaming, path, name, {})
+                    self.corrections[name] = corr
+                except Exception as e:
+                    raise ValueError(
+                        f"Correction '{name}' not found in CorrectionSet at {path}. "
+                        f"Error: {e}"
+                    )
+
+    def __call__(self, **kwargs):
+        """
+        Apply corrections sequentially, updating JetPt after each correction.
+
+        Args:
+            **kwargs: Must include JetPt, and typically JetEta, JetA, Rho
+
+        Returns:
+            Combined correction factor
+        """
+        if "JetPt" not in kwargs:
+            msg = "'JetPt' must be provided in kwargs for compound correction."
+            raise ValueError(msg)
+
+        if not self.corrections:
+            return 1.0
+
+        correction_factor = 1.0
+        current_kwargs = kwargs.copy()
+        for corr in self.corrections.values():
+            # Check if we need to broadcast anything
+            current_kwargs = dict(zip(
+                current_kwargs.keys(),
+                ak.broadcast_arrays(*current_kwargs.values())
+            ))
+            factor = corr(**current_kwargs)
+            correction_factor = correction_factor * factor
+
+            # Update pt for next correction in chain
+            current_kwargs['JetPt'] = current_kwargs['JetPt'] * factor
+        return correction_factor
+
+
+class JetIdProducer:
+    def __init__(self, jsonfile, jettype):
+        """Module to determine jetID variables (passTight, passTightLepVeto),
+        packed in Jet_jetId as in nanoAODv12
+
         Parameters
         ----------
-        filepath
-            Path to the json file containing the scale factors
-        tau_id
-            The tau id to be used. For example "DeepTau2017v2p1VSjet"
-        wp_VSjet
-            The working point for the tau id vs jet
-        wp_VSe
-            The working point for the tau id vs electron
-        type
-            The type of the scale factors. For example "pt" or "eta"
+        json
+            jetID json file provided by the JetMET POG
+        jettype
+            jet type used in the analysis ("AK4PUPPI" or "AK4CHS")
         """
-        self.sf = correctionlib.CorrectionSet.from_file(filepath)
-        self.corr = self.sf[tau_id]
-        self.wp_VSjet = wp_VSjet
-        self.wp_VSe = wp_VSe
-        self.type = sfs_type
-    
-    def __call__(self, tau_pt, tau_dm, genmatch, syst):
-        sfs = self.corr.evaluate(tau_pt, tau_dm, genmatch, self.wp_VSjet, self.wp_VSe, syst, self.type)
-        return np.array(sfs)
-    
+        self.corrset = correctionlib.CorrectionSet.from_file(jsonfile)
+        self.tight = self.corrset[f"{jettype}_Tight"]
+        self.tightLepVeto = self.corrset[f"{jettype}_TightLeptonVeto"]
+
+    def evaluate(self, jet):
+
+        multiplicity = jet.chMultiplicity + jet.neMultiplicity
+
+        passTight = onedimeval(
+            self.tight.evaluate,
+            jet.eta,
+            jet.chHEF,
+            jet.neHEF,
+            jet.chEmEF,
+            jet.neEmEF,
+            jet.muEF,
+            jet.chMultiplicity,
+            jet.neMultiplicity,
+            multiplicity,
+        )
+
+        passTightLepVeto = onedimeval(
+            self.tightLepVeto.evaluate,
+            jet.eta,
+            jet.chHEF,
+            jet.neHEF,
+            jet.chEmEF,
+            jet.neEmEF,
+            jet.muEF,
+            jet.chMultiplicity,
+            jet.neMultiplicity,
+            multiplicity,
+        )
+
+        passTight = ak.values_astype(passTight, bool)
+        passTightLepVeto = ak.values_astype(passTightLepVeto, bool)
+
+        return passTight, passTightLepVeto

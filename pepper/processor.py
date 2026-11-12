@@ -7,13 +7,16 @@ from coffea.nanoevents import NanoAODSchema
 import h5py
 import json
 import logging
-from time import time
+from time import time, time_ns
 import abc
 import uuid
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 import concurrent.futures
 from tqdm import tqdm
+from tempfile import mkdtemp
+import subprocess
+import shutil
 
 import pepper
 from pepper import Selector, OutputFiller, HDF5File
@@ -22,6 +25,115 @@ import pepper.htcondor
 
 
 logger = logging.getLogger(__name__)
+
+
+class EventOutputFile():
+    """Class to represent an output file for per-event data
+
+    This is used to save the per-event data in a file. The file is created
+    with a unique name, so that it does not overwrite existing files.
+
+    If use_temp is True, the file is first created in a temporary local
+    directory, and then copied to the final destination when closed.
+    If the file is supposed to be saved on eos, the eos command line tool
+    is used to copy the file.
+    """
+
+    def __init__(self, eventdir, dsname, identifier, filetype, use_temp):
+        self.eventdir = os.path.realpath(eventdir)
+        self.dsname = dsname
+        self.identifier = identifier
+        self.filetype = filetype
+        self.use_temp = use_temp
+        self.file = None
+        self.actual_filepath = None
+
+        if self.filetype == "root":
+            self.ext = ".root"
+        elif self.filetype == "hdf5":
+            self.ext = ".h5"
+        else:
+            raise ValueError(f"Invalid filetype: {self.filetype}")
+
+    def get_random_filename(self):
+        filehash = hash((*self.identifier, time_ns()))
+        filename = "{:016x}".format(filehash % 16**16) + self.ext
+        return filename
+
+    def __enter__(self):
+        dsname = self.dsname.replace("/", "_")
+        if self.use_temp:
+            dsdir = mkdtemp()
+        else:
+            dsdir = os.path.join(self.eventdir, dsname)
+            os.makedirs(dsdir, exist_ok=True)
+        while True:
+            filename = self.get_random_filename()
+            filepath = os.path.join(dsdir, filename)
+            if os.path.exists(filepath):
+                logger.warn("Got a file locking conflict for path "
+                            f"'{filepath}'. Continuing with next file")
+                continue
+
+            # Open in exclusive file mode
+            # to prevent race conditions with other processes
+            try:
+                if self.filetype == "root":
+                    # Pass through open() to use the exclusive
+                    # file mode 'x'
+                    self.file = uproot.recreate(open(filepath, "x+b"))
+                elif self.filetype == "hdf5":
+                    # h5py supports the 'x' mode directly
+                    self.file = h5py.File(filepath, "x")
+
+                self.actual_filepath = filepath
+            except (FileExistsError, OSError, BlockingIOError):
+                logger.warn("Got a file locking conflict for path "
+                            f"'{filepath}'. Continuing with next file")
+                continue
+            else:
+                break
+        logger.debug(f"Opened output {filepath}")
+        return self.file
+
+    def _copy_directly(self, dsdir, dest_path):
+        if not os.path.exists(dsdir):
+            os.makedirs(dsdir, exist_ok=True)
+        shutil.copy2(self.actual_filepath, dest_path)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.file.close()
+
+        if self.use_temp:
+            dsname = self.dsname.replace("/", "_")
+            dsdir = os.path.join(self.eventdir, dsname)
+
+            filename = os.path.basename(self.actual_filepath)
+            while os.path.exists(os.path.join(dsdir, filename)):
+                logger.warn("Got a file locking conflict for eos path "
+                            f"'{os.path.join(dsdir, filename)}'. Continuing "
+                            "with next file")
+                filename = self.get_random_filename()
+            dest_path = os.path.join(dsdir, filename)
+            if self.eventdir.startswith("/eos"):
+                dest_url = pepper.misc.eos_path_to_url(dest_path)
+                try:
+                    subprocess.run(
+                        ["eos", "cp", "-p", self.actual_filepath, dest_url],
+                        check=True)
+                except subprocess.CalledProcessError as e:
+                    logger.warning(f"Failed to copy file to eos: {e}")
+                    logger.warning("Trying using system command directly")
+                    self._copy_directly(dsdir, dest_path)
+                else:
+                    os.remove(self.actual_filepath)
+                    logger.debug(f"Copied output file to eos: {dest_path}")
+            else:
+                logger.debug(f"Copying output file to {dest_path}")
+                self._copy_directly(dsdir, dest_path)
+
+            # Clean up temporary directory
+            shutil.rmtree(os.path.dirname(self.actual_filepath))
 
 
 class Processor(coffea.processor.ProcessorABC):
@@ -57,15 +169,22 @@ class Processor(coffea.processor.ProcessorABC):
             saved. Every chunk will be saved in its own file. If `None`,
             nothing will be saved.
         """
-        self._check_config_integrity(config)
+        if config.check_integrity:
+            self._check_config_integrity(config)
         self.config = config
         if eventdir is not None:
             self.eventdir = os.path.realpath(eventdir)
+            if "use_temp_eventdir" in self.config:
+                self.use_temp_eventdir = self.config["use_temp_eventdir"]
+            else:
+                self.use_temp_eventdir = self.eventdir.startswith("/eos")
         else:
             self.eventdir = None
 
         self.rng_seed = self._load_rng_seed()
         self.loglevel = logging.getLogger("pepper").level
+        self.column_tracing_result = None
+        self.column_buffer_cache = None
 
     @staticmethod
     def _check_config_integrity(config):
@@ -73,6 +192,8 @@ class Processor(coffea.processor.ProcessorABC):
         configuration for obvious errors, so that the user has an immediate
         error message.
         """
+        config.check_required_args()
+
         # Check for duplicate names in columns_to_save
         column_names = []
         if "columns_to_save" in config:
@@ -90,6 +211,69 @@ class Processor(coffea.processor.ProcessorABC):
                         f"Ambiguous column to save '{key}' (from {specifier})")
                 else:
                     column_names.append(key)
+        if "bad_file_paths" in config:
+            raise pepper.config.ConfigError(
+                "'bad_file_paths' is deprecated due to ambiguity. Please "
+                "use 'file_blacklist' if you want to completely skip files, "
+                "and use 'local_file_blackist' if you want to replace bad "
+                "local files by remote files in 'local+xrootd' mode.")
+        if "local_file_blacklist" in config \
+            and not ("file_mode" in config
+                     and config["file_mode"] == "local+xrootd"):
+            logger.warning("'local_file_blacklist' specified in config but "
+                           "file mode is not 'local+xrootd'. Blacklist "
+                           "will be ignored. If you want to skip files, "
+                           "use 'file_blacklist' instead.")
+
+        if not config["mc_lumifactors"]:
+            for proc in config["mc_datasets"]:
+                if (proc not in config["crosssections"] and not
+                        ("dataset_for_systematics" in config and
+                         proc in config["dataset_for_systematics"])):
+                    raise ValueError(f"Could not find crosssection for {proc}")
+
+        if (not config["mc_lumifactors"] and "normalize_pdf_uncs" in config
+                and config["normalize_pdf_uncs"] and "split_pdf_uncs" in config
+                and not config["split_pdf_uncs"]):
+            raise pepper.config.ConfigError(
+                "PDF uncertainties can only be normalised after processing if "
+                "they are split. Please set 'split_pdf_uncs' to true, "
+                "'normalize_pdf_uncs' to false, or specify a pre-computed "
+                "'mc_lumifactors' file")
+
+        if (config["mc_lumifactors"] and "exit_on_failed_jobs" in config
+                and config["exit_on_failed_jobs"].lower() != "all"):
+            logger.warning(
+                "Allowing continuing past max retries is not recommended for "
+                "pre-computed lumifactors. Please set 'exit_on_failed_jobs' to"
+                " 'all', or 'mc_lumifactors' to false (posterior computation)")
+
+        if ("exit_on_failed_jobs" in config
+                and config["exit_on_failed_jobs"].lower() == "none"):
+            logger.warning(
+                'Not exiting on failed jobs can lead to silent exclusion of data in '
+                'final histograms. "exit_on_failed_jobs": "none" is only recommended '
+                'for testing.')
+
+        for dsname in config["mc_datasets"].keys():
+            if (config["mc_lumifactors"] and
+                    dsname not in config["mc_lumifactors"]):
+                raise pepper.config.ConfigError(
+                    f"{dsname} is not in mc_lumifactors")
+
+        for dsname in config["exp_datasets"].keys():
+            if dsname not in config["dataset_trigger_map"]:
+                raise pepper.config.ConfigError(
+                    f"{dsname} is not in dataset_trigger_map")
+            if isinstance(config["dataset_trigger_order"], dict):
+                trigorder = set()
+                for datasets in config["dataset_trigger_order"].values():
+                    trigorder |= set(datasets)
+            else:
+                trigorder = config["dataset_trigger_order"]
+            if dsname not in trigorder:
+                raise pepper.config.ConfigError(
+                    f"{dsname} is not in dataset_trigger_order")
 
     @staticmethod
     def _get_hists_from_config(config, key, todokey):
@@ -172,48 +356,6 @@ class Processor(coffea.processor.ProcessorABC):
         """
         return accumulator
 
-    def _open_output(self, dsname, filetype):
-        """Try to open an output file for writing the per-event data. It is
-        ensured the file is newly created and does not overwrite existing data.
-
-        Parameters
-        ----------
-        dsname
-            Name of the data set of the data
-        filetype
-            Either "root" or "hdf5". The type of the output file
-
-        Returns
-        -------
-            File object of the opened file
-        """
-        if filetype == "root":
-            ext = ".root"
-        elif filetype == "hdf5":
-            ext = ".h5"
-        else:
-            raise ValueError(f"Invalid filetype: {filetype}")
-        dsname = dsname.replace("/", "_")
-        dsdir = os.path.join(self.eventdir, dsname)
-        os.makedirs(dsdir, exist_ok=True)
-        i = 0
-        while True:
-            filepath = os.path.join(dsdir, str(i).zfill(4) + ext)
-            try:
-                f = open(filepath, "x")
-            except (FileExistsError, OSError):
-                i += 1
-                continue
-            else:
-                break
-        f.close()
-        if filetype == "root":
-            f = uproot.recreate(filepath)
-        elif filetype == "hdf5":
-            f = h5py.File(filepath, "w")
-        logger.debug(f"Opened output {filepath}")
-        return f
-
     def _prepare_saved_columns(self, selector):
         """Creates an array to be saved as per-event data. The content is taken
         from the selectors and the data pickers defined in the config."""
@@ -253,8 +395,8 @@ class Processor(coffea.processor.ProcessorABC):
         cutnames, cutflags = selector.get_cuts()
         out_dict["cutnames"] = cutnames
         out_dict["cutflags"] = cutflags
-        if ("save_categories_per_event" not in self.config or
-                self.config["save_categories_per_event"]):
+        if (len(selector.cats) > 0
+                and self.config.get("save_categories_per_event", True)):
             out_dict["categories"] = \
                 self._prepare_saved_categories(selector)
         if (self.config["compute_systematics"] and save_full_sys
@@ -264,7 +406,8 @@ class Processor(coffea.processor.ProcessorABC):
         elif selector.systematics is not None:
             out_dict["weight"] = ak.flatten(
                 selector.systematics["weight"], axis=0)
-        with self._open_output(dsname, "hdf5") as f:
+        with EventOutputFile(self.eventdir, dsname, identifier, "hdf5",
+                             self.use_temp_eventdir) as f:
             outf = HDF5File(f)
             for key in out_dict.keys():
                 outf[key] = out_dict[key]
@@ -281,26 +424,64 @@ class Processor(coffea.processor.ProcessorABC):
 
         Returns
         -------
-            Dict with unsmaked arrays and their masks. The masks have the same
+            Dict with unmasked arrays and their masks. The masks have the same
             key prefixed by "mask"
         """
         ret = {}
         for key, array in arrays.items():
-            if (not isinstance(array, ak.Array)
-                    or not pepper.misc.akismasked(array)):
+            if not isinstance(array, ak.Array):
                 ret[key] = array
                 continue
             if array.ndim > 2:
                 raise ValueError(
                     f"Array '{key}' as too many dimensions for ROOT output")
-            if "mask" + key in arrays:
-                raise RuntimeError(f"Output named 'mask{key}' already present "
-                                   "but need this key for storing the mask")
-            ret["mask" + key] = ~ak.is_none(array)
-            if len(array.fields) > 0:
-                ret[key] = ak.fill_none(array, {k: 0 for k in array.fields})
-            else:
-                ret[key] = ak.fill_none(array, 0)
+
+            if pepper.misc.akismasked(array):
+                is_none = ak.is_none(array)
+                # sometimes there are no actual Nones even though the type says that
+                # there should be, because of an issue in ak.to_packed:
+                # https://github.com/scikit-hep/awkward/issues/3939
+                # workaround by checking explicitly and dropping nones
+                if not ak.any(is_none):
+                    array = ak.drop_none(array)
+                else:
+                    if "mask" + key in arrays:
+                        raise RuntimeError(f"Output named 'mask{key}' already present "
+                                           "but need this key for storing the mask")
+                    ret["mask" + key] = ~is_none
+                    if array.ndim > 1:
+                        # 2D array with masked values in the first axis
+                        # will cause trouble for uproot - replace Nones by empty lists
+                        array = ak.fill_none(array, [], axis=0)
+                    elif len(array.fields) > 0:
+                        array = ak.fill_none(array, {k: 0 for k in array.fields})
+                    else:
+                        array = ak.fill_none(array, 0)
+
+            # Check for case mask is at level of individual fields
+            if any([pepper.misc.akismasked(array[k]) for k in array.fields]):
+                counts = None
+                can_zip = True
+                for k in array.fields:
+                    if "mask" + key not in arrays:
+                        ret["mask" + key] = ~ak.is_none(array[k])
+                    elif ret["mask" + key] != ~ak.is_none(array[k]):
+                        raise RuntimeError(
+                            f"Inconsistent masks for fields of key {key}. Please "
+                            f"output these as separate columns")
+                    if (can_zip and array[k].ndim > 1):
+                        if counts is None:
+                            counts = ak.num(array[k])
+                        else:
+                            can_zip = ak.all(counts == ak.num(array[k]))
+                    else:
+                        can_zip = False
+                if can_zip:
+                    array = ak.zip({k: ak.fill_none(array[k], 0) for k in array.fields})
+                else:
+                    array = ak.Array({k: ak.fill_none(array[k], 0) for k in array.fields})
+
+            ret[key] = array
         return ret
 
     def _save_per_event_info_root(self, dsname, selector, identifier,
@@ -313,9 +494,10 @@ class Processor(coffea.processor.ProcessorABC):
             events = self._prepare_saved_columns(selector)
             # Workaround: Use ak.packed to make sure offset arrays of virtual
             # arrays are not given to uproot. Uproot has a bug for these.
-            events = {f: ak.packed(events[f]) for f in ak.fields(events)}
+            events = {f: ak.to_packed(events[f]) for f in ak.fields(events)}
             additional = {}
-            additional["cutflags"] = cutflags
+            if cutflags is not None:
+                additional["cutflags"] = cutflags
             if selector.systematics is not None:
                 additional["weight"] = selector.systematics["weight"]
                 if self.config["compute_systematics"] and save_full_sys:
@@ -330,17 +512,22 @@ class Processor(coffea.processor.ProcessorABC):
             events.update(additional)
             events = self._separate_masks_for_root(events)
             out_dict["Events"] = events
-            if ("save_categories_per_event" not in self.config or
-                    self.config["save_categories_per_event"]):
+            if (len(selector.cats) > 0
+                    and self.config.get("save_categories_per_event", True)):
                 cats = self._prepare_saved_categories(selector)
                 for cat in ak.fields(cats):
                     out_dict[f"Categories/{cat}"] = \
                         self._separate_masks_for_root(
-                            {f: ak.packed(cats[cat][f])
+                            {f: ak.to_packed(cats[cat][f])
                              for f in ak.fields(cats[cat])})
-        with self._open_output(dsname, "root") as outf:
+        with EventOutputFile(
+                self.eventdir, dsname, identifier, "root",
+                self.use_temp_eventdir) as outf:
             for key in out_dict.keys():
-                outf[key] = out_dict[key]
+                if isinstance(out_dict[key], dict):
+                    outf.mktree(key, out_dict[key])
+                else:
+                    outf[key] = out_dict[key]
 
     def save_per_event_info(self, dsname, selector, save_full_sys=True):
         """Save the per-event info
@@ -441,6 +628,9 @@ class Processor(coffea.processor.ProcessorABC):
 
         filler = self.setup_outputfiller(dsname, is_mc)
         selector = self.setup_selection(data, dsname, is_mc, filler)
+        if not self.config["mc_lumifactors"]:
+            filler.fill_gen_sumws(selector.systematics["weight"])
+
         self.process_selection(selector, dsname, is_mc, filler)
 
         if self.eventdir is not None:
@@ -484,11 +674,17 @@ class Processor(coffea.processor.ProcessorABC):
         else:
             cuts_to_histogram = None
 
+        if "systs_to_histogram" in self.config:
+            systs_to_histogram = self.config["systs_to_histogram"]
+        else:
+            systs_to_histogram = None
+
         hists = self._get_hists_from_config(
             self.config, "hists", "hists_to_do")
         filler = OutputFiller(
             hists, is_mc, dsname, dsname_in_hist, sys_enabled,
-            sys_overwrite=sys_overwrite, cuts_to_histogram=cuts_to_histogram)
+            sys_overwrite=sys_overwrite, cuts_to_histogram=cuts_to_histogram,
+            systs_to_histogram=systs_to_histogram)
 
         return filler
 
@@ -512,14 +708,20 @@ class Processor(coffea.processor.ProcessorABC):
             A new instance of ``Selector`` for the selection
         """
         if is_mc:
-            genweight = data["genWeight"]
+            if (("norm_genweights" in self.config
+                    and self.config["norm_genweights"])
+                    or ("genweights_to_norm" in self.config and
+                        dsname in self.config["genweights_to_norm"])):
+                genweight = np.sign(data["genWeight"])
+            else:
+                genweight = data["genWeight"]
         else:
             genweight = np.ones(len(data))
         # Use a different seed for every chunk in a reproducable way
         seed = (self.rng_seed, uuid.UUID(data.metadata["fileuuid"]).int,
                 data.metadata["entrystart"])
         selector = Selector(data, genweight, filler.get_callbacks(),
-                            rng_seed=seed)
+                            rng_seed=seed, output_filler=filler)
         return selector
 
     @abc.abstractmethod
@@ -695,6 +897,40 @@ class Processor(coffea.processor.ProcessorABC):
         with open(os.path.join(dest, "hists.json"), "w") as f:
             hist_col.save_metadata_json(f)
 
+    def apply_lumifactors_post(self, output):
+        crosssections = self.config["crosssections"]
+        if "dataset_for_systematics" in self.config:
+            dsforsys = self.config["dataset_for_systematics"]
+        else:
+            dsforsys = {}
+        for dsname in output["gen_sumws"].keys():
+            if dsname not in self.config["mc_datasets"].keys():
+                continue
+            if dsname in dsforsys:
+                xs = crosssections[dsforsys[dsname][0]]
+            else:
+                xs = crosssections[dsname]
+            factor = (xs * self.config["luminosity"]
+                      / output["gen_sumws"][dsname]["gen_sumw"])
+            output["cutflows"][dsname] = {
+                k: v * factor for k, v in output["cutflows"][dsname].items()}
+            output["hists"][dsname] = {
+                k: v * factor for k, v in output["hists"][dsname].items()}
+            if len(output["gen_sumws"][dsname]) > 1:
+                factors = {}
+                for key in output["gen_sumws"][dsname].keys():
+                    if key != "gen_sumw":
+                        factors[key] = (
+                            output["gen_sumws"][dsname]["gen_sumw"]
+                            / output["gen_sumws"][dsname][key])
+                for hkey, hist in output["hists"][dsname].items():
+                    if (hkey[0] != "BeforeCuts"
+                            and dsname not in
+                            self.config["dataset_for_systematics"]
+                            and len(hist.axes["sys"]) > 0):
+                        pepper.hist_utils.scale_histogram(hist, "sys", factors)
+        return output
+
     def save_output(self, output, dest):
         """Save the histograms and cutflows to files
 
@@ -705,6 +941,19 @@ class Processor(coffea.processor.ProcessorABC):
         dest
             Destination direction
         """
+        if not self.config["mc_lumifactors"]:
+            output = self.apply_lumifactors_post(output)
+
+        # Save gen_sumws for normalising per-event output
+        if self.eventdir is not None and len(output["gen_sumws"]) > 0:
+            outpath = os.path.join(dest, "gen_sumws.json")
+            logger.warning(
+                f"Per-event outputs are only normalised when using "
+                f"pre-computed mc lumifactors. Please normalise these "
+                f"outputs using the sum weights in {outpath}.")
+            with open(outpath, "w") as f:
+                json.dump(output["gen_sumws"], f, indent=4)
+
         # Save cutflows
         with open(os.path.join(dest, "cutflows.json"), "w") as f:
             json.dump(self._prepare_cutflows(output), f, indent=4)
@@ -720,3 +969,26 @@ class Processor(coffea.processor.ProcessorABC):
         hist_dest = os.path.join(dest, "hists")
         os.makedirs(hist_dest, exist_ok=True)
         self.save_histograms(hform, output, hist_dest)
+
+    def columns_to_preload(self):
+        """nanoAOD columns that should pre preloaded by coffea for speed.
+        By default corresponds to those determined with --trace, and none
+        otherwise. Can be overwritten to specifiy columns that --trace might
+        miss.
+        """
+
+        if self.column_tracing_result is not None:
+            return self.column_tracing_result
+        else:
+            return set()
+
+    def unload_column(self, column):
+        """Unload a column from memory. This can be used to save memory if some
+        columns are only needed for a part of the selection.
+        Matching of the column names is greedy."""
+        if self.column_buffer_cache is not None:
+            keys_to_pop = [key for key in self.column_buffer_cache.keys()
+                           if "/" + column in key or "/n" + column in key]
+            for key in keys_to_pop:
+                logger.debug(f"Unloading column {key} from memory")
+                self.column_buffer_cache.pop(key, None)

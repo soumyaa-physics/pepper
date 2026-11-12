@@ -4,10 +4,10 @@ import hjson
 import os
 import logging
 from collections.abc import MutableMapping
+import re
 
 import pepper
 from pepper import HistDefinition
-
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +19,25 @@ class ConfigError(RuntimeError):
 class Config(MutableMapping):
     def __init__(self, path, textparser=hjson.load, cwd="."):
         """Initialize the configuration.
+
+        The default list of required arguments, behaviours, and  special variables
+        is:
+
+        - Required Args:
+            - exp_datasets
+            - mc_datasets
+            - mc_lumifactors
+        - Behaviors:
+            - file_blacklist: load from external file if a string is given
+            - local_file_blacklist: load from external file if a string is given
+            - xrootd_url_blacklist: load from external file if a string is given
+            - mc_lumifactors: load from external file if a string is given
+            - hists: load from external file if a string is given, parse into
+              HistDefinition objects
+        - Special Vars:
+            - $DATADIR: replaced with the value of ``datadir`` in the config
+            - $CONFDIR: replaced with the directory containing the config file
+            - $STOREDIR: replaced with the value of ``store`` in the config
 
         Parameters
         ----------
@@ -37,6 +56,7 @@ class Config(MutableMapping):
         self._overwritten = {}
         self._textparser = textparser
         self._cwd = os.path.realpath(cwd)
+        self.check_integrity = True
 
         logger.debug("Configuration read")
         if "datadir" in self._config:
@@ -55,16 +75,58 @@ class Config(MutableMapping):
             "$STOREDIR": "store",
         }
         self.behaviors = {
-            "bad_file_paths": self._get_maybe_external,
-            "hists": self._get_hists
+            "file_blacklist": self._get_maybe_external,
+            "local_file_blacklist": self._get_maybe_external,
+            "xrootd_url_blacklist": self._get_maybe_external,
+            "mc_lumifactors": self._get_maybe_external,
+            "crosssections": self._get_maybe_external,
+            "hists": self._get_hists,
+            "columns_to_save": self._get_maybe_external
         }
+        self.required_args = [
+            "exp_datasets",
+            "mc_datasets",
+            "mc_lumifactors",
+        ]
+
+    def check_required_args(self):
+        for arg in self.required_args:
+            if arg not in self:
+                raise ConfigError(
+                    f"Missing required argument in config: {arg}")
+
+    def _load_config(self, path, prev_imports=None):
+        if prev_imports is None:
+            prev_imports = set()
+        if ".toml" in path:
+            try:
+                import tomli
+            except ImportError:
+                logger.error(
+                    "The 'tomli' module is not installed."
+                    "Please install it to read .toml config files."
+                    )
+                raise
+            with open(path, "rb") as f:
+                conf = tomli.load(f)
+        else:
+            with open(path) as f:
+                conf = self._textparser(f)
+        if "import" in conf:
+            import_path = os.path.realpath(conf["import"])
+            if import_path in prev_imports:
+                raise ConfigError(f"Circular configuration import in {path}")
+            prev_imports.add(import_path)
+            imported = self._load_config(import_path, prev_imports)
+            imported.update(conf)
+            conf = imported
+        return conf
 
     @property
     def _config(self):
         if self._config_loaded is not None:
             return self._config_loaded
-        with open(self._path) as f:
-            self._config_loaded = self._textparser(f)
+        self._config_loaded = self._load_config(self._path)
         self._config_loaded["configdir"] = os.path.dirname(self._path)
         return self._config_loaded
 
@@ -104,8 +166,7 @@ class Config(MutableMapping):
 
     def _get_hists(self, value):
         hist_config = self._get_maybe_external(value)
-        return {k: HistDefinition(c, self["compute_systematics"])
-                for k, c in hist_config.items()}
+        return {k: HistDefinition(c) for k, c in hist_config.items()}
 
     def _get(self, key):
         if key in self._overwritten:
@@ -212,18 +273,29 @@ class Config(MutableMapping):
             if ((dstype == "mc" and dataset not in self["mc_datasets"])
                     or (dstype == "data"
                         and dataset not in self["exp_datasets"])
-                    or (include is not None and dataset not in include)
+                    or (include is not None and not
+                        any([re.compile(frag).match(dataset)
+                             for frag in include]))
                     or (exclude is not None and dataset in exclude)):
                 del datasets[dataset]
         requested_datasets = datasets.keys()
 
         mode = self["file_mode"] if "file_mode" in self else "local"
         store = self["store"] if "store" in self else None
-        skippaths = (set(self["bad_file_paths"]) if "bad_file_paths" in self
-                     else set())
+        ignore_path = None
+        if "file_blacklist" in self:
+            file_blacklist = set(self["file_blacklist"])
+
+            def is_lfn_in_bad_paths(lfn):
+                return lfn in file_blacklist or \
+                    (lfn.startswith("cmslfn:/")
+                     and lfn[len('cmslfn:/'):] in file_blacklist)
+            ignore_path = is_lfn_in_bad_paths
+        use_eos_redirector = self.get("use_eos_redirector", True)
         logger.debug("Finding files for data sets")
         datasets, paths2dsname = pepper.datasets.expand_datasetdict(
-            datasets, store=store, mode=mode, ignore_path=list(skippaths))
+            datasets, store=store, mode=mode,
+            ignore_path=ignore_path, use_eos_redirector=use_eos_redirector)
         missing_datasets = requested_datasets - datasets.keys()
         if len(missing_datasets) > 0:
             raise ConfigError("Could not find files for: "
@@ -253,19 +325,27 @@ class Config(MutableMapping):
         """
         store = None
         xrootddomain = None
-        skippaths = self["bad_file_paths"] if "bad_file_paths" in self else\
-            None
+        xrootd_url_blacklist = None
+        local_file_blacklist = self["local_file_blacklist"] \
+            if "local_file_blacklist" in self else None
         filemode = self["file_mode"] if "file_mode" in self else "local"
         if filemode == "local" or filemode == "local+xrootd":
             store = self["store"]
         if filemode == "xrootd" or filemode == "local+xrootd":
             xrootddomain = self["xrootddomain"]
+            if "xrootd_url_blacklist" in self:
+                xrootd_url_blacklist = self["xrootd_url_blacklist"]
+        use_eos_redirector = self.get("use_eos_redirector", True)
+        xrootd_url_priority = self.get("xrootd_url_priority", None)
 
         if lfn.startswith("cmslfn://"):
-            filepaths = pepper.datasets.resolve_lfn(lfn, store, xrootddomain)
+            filepaths = pepper.datasets.resolve_lfn(lfn, store, xrootddomain,
+                                                    xrootd_url_blacklist,
+                                                    use_eos_redirector,
+                                                    xrootd_url_priority)
         else:
             filepaths = [lfn]
-        if skippaths is not None:
-            filepaths = [p for p in filepaths if p not in skippaths]
+        if local_file_blacklist is not None:
+            filepaths = [p for p in filepaths if p not in local_file_blacklist]
 
         return filepaths

@@ -7,6 +7,7 @@ from copy import copy
 
 import pepper
 import pepper.config
+from pepper.misc import get_run_for_year, LHCRun
 
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,55 @@ class Processor(pepper.ProcessorBasicPhysics):
 
     def __init__(self, config, eventdir):
         super().__init__(config, eventdir)
+
+    def _validate_jec_requirements(self, config):
+        """
+        Validate that required JEC corrections are present for JER smearing and reapply_jec.
+        """
+        use_correctionlib = "jme_correctionlib_corrections" in config
+        reapply_jec = config.get("reapply_jec", False)
+
+        # Helper to check if a value is non-empty
+        def is_populated(val):
+            if not val:
+                return False
+            if isinstance(val, (list, dict)):
+                return len(val) > 0
+            if isinstance(val, str):
+                return val.strip() != ""
+            return True
+
+        # Get the config section to check
+        jme_config = (
+            config["jme_correctionlib_corrections"]
+            if use_correctionlib
+            else config
+        )
+
+        # Check if JER is configured (needs both resolution and SF)
+        has_jer = (
+            is_populated(jme_config.get("jet_resolution")) and
+            is_populated(jme_config.get("jet_ressf"))
+        )
+
+        # Check MC corrections requirement
+        has_jet_correction_mc = is_populated(jme_config.get("jet_correction_mc"))
+
+        if not has_jet_correction_mc and (has_jer or reapply_jec):
+            prefix = "jme_correctionlib_corrections." if use_correctionlib else ""
+            raise pepper.config.ConfigError(
+                f"Need {prefix}jet_correction_mc for propagating jet "
+                "smearing/variation to MET or because reapply_jec is true"
+            )
+
+        # Check data corrections requirement (only needed when reapply_jec is true)
+        has_jet_correction_data = is_populated(jme_config.get("jet_correction_data"))
+
+        if not has_jet_correction_data and reapply_jec:
+            prefix = "jme_correctionlib_corrections." if use_correctionlib else ""
+            raise pepper.config.ConfigError(
+                f"Need {prefix}jet_correction_data because reapply_jec is true"
+            )
 
     def _check_config_integrity(self, config):
         """Check integrity of configuration file."""
@@ -41,29 +91,32 @@ class Processor(pepper.ProcessorBasicPhysics):
         if "btag_sf" not in config or len(config["btag_sf"]) == 0:
             logger.warning("No btag scale factor specified")
 
-        if ("jet_uncertainty" not in config and config["compute_systematics"]):
+        jet_uncertainty_in_config = (
+            "jet_uncertainty" in config or
+            "jet_uncertainty" in config.get("jme_correctionlib_corrections", {})
+        )
+        if (not jet_uncertainty_in_config and config["compute_systematics"]):
             logger.warning("No jet uncertainty specified")
 
-        if ("jet_resolution" not in config or "jet_ressf" not in config):
+        self._validate_jec_requirements(config)
+        if (("jet_resolution" not in config or "jet_ressf" not in config) and
+                ("jet_resolution" not in config.get("jme_correctionlib_corrections", {}) or
+                    "jet_ressf" not in config.get("jme_correctionlib_corrections", {}))):
             logger.warning("No jet resolution or no jet resolution scale "
                            "factor specified. This is necessary for "
                            "smearing, even if not computing systematics")
-        if "jet_correction_mc" not in config and (
-                ("jet_resolution" in config and "jet_ressf" in config) or
-                ("reapply_jec" in config and config["reapply_jec"])):
-            raise pepper.config.ConfigError(
-                "Need jet_correction_mc for propagating jet "
-                "smearing/variation to MET or because reapply_jec is true")
-        if ("jet_correction_data" not in config and "reapply_jec" in config
-                and config["reapply_jec"]):
-            raise pepper.config.ConfigError(
-                "Need jet_correction_data because reapply_jec is true")
 
         if "muon_rochester" not in config:
             logger.warning("No Rochster corrections for muons specified")
 
-        if "jet_puid_sf" not in config:
+        if ("jet_puid_sf" not in config and
+                get_run_for_year(config["year"]) == LHCRun.Run2):
+            # Jet PU ID SFs are only needed for Run2
             logger.warning("No jet PU ID SFs specified")
+
+        if ("jet_veto_map" not in config and
+                get_run_for_year(config["year"]) == LHCRun.Run3):
+            logger.warning("No jet veto map specified")
 
         if ("reco_algorithm" in config and "reco_info_file" not in config):
             raise pepper.config.ConfigError(
@@ -104,25 +157,6 @@ class Processor(pepper.ProcessorBasicPhysics):
                         f"{dsname} in crosssection_uncertainty but not in "
                         "mc_datasets")
 
-        for dsname in config["mc_datasets"].keys():
-            if dsname not in config["mc_lumifactors"]:
-                raise pepper.config.ConfigError(
-                    f"{dsname} is not in mc_lumifactors")
-
-        for dsname in config["exp_datasets"].keys():
-            if dsname not in config["dataset_trigger_map"]:
-                raise pepper.config.ConfigError(
-                    f"{dsname} is not in dataset_trigger_map")
-            if isinstance(config["dataset_trigger_order"], dict):
-                trigorder = set()
-                for datasets in config["dataset_trigger_order"].values():
-                    trigorder |= set(datasets)
-            else:
-                trigorder = config["dataset_trigger_order"]
-            if dsname not in trigorder:
-                raise pepper.config.ConfigError(
-                    f"{dsname} is not in dataset_trigger_order")
-
         if "drellyan_sf" not in config:
             logger.warning("No Drell-Yan scale factor specified")
 
@@ -137,18 +171,19 @@ class Processor(pepper.ProcessorBasicPhysics):
 
     def process_selection(self, selector, dsname, is_mc, filler):
         era = self.get_era(selector.data, is_mc)
+        if self.config["compute_systematics"] and is_mc:
+            self.add_generator_uncertainies(dsname, selector)
         if dsname.startswith("TTTo"):
-            selector.set_column("gent_lc", self.gentop, lazy=True)
+            selector.set_column("gent_lc", self.gentop)
             if "top_pt_reweighting" in self.config:
                 selector.add_cut(
                     "TopPtReweighting", self.do_top_pt_reweighting,
                     no_callback=True)
+            self.unload_column("GenPart")
         if is_mc and "pileup_reweighting" in self.config:
             selector.add_cut("PileupReweighting", partial(
                 self.do_pileup_reweighting, dsname))
-        if self.config["compute_systematics"] and is_mc:
-            self.add_generator_uncertainies(dsname, selector)
-        if is_mc:
+        if is_mc and self.config["mc_lumifactors"]:
             selector.add_cut(
                 "CrossSection", partial(self.crosssection_scale, dsname))
 
@@ -167,19 +202,26 @@ class Processor(pepper.ProcessorBasicPhysics):
 
         selector.add_cut("METFilters", partial(self.met_filters, is_mc))
 
+        if "muon_rochester" in self.config:
+            # Override muon column to apply Rochester corrections
+            selector.set_column("Muon", partial(
+                self.apply_rochester_corr, selector.rng, is_mc))
         selector.add_cut("NoAddLeps",
                          partial(self.no_additional_leptons, is_mc))
         selector.set_column("Electron", self.pick_electrons)
         selector.set_column("Muon", self.pick_muons)
-        selector.set_column("Lepton", partial(
-            self.build_lepton_column, is_mc, selector.rng))
+        selector.set_column("Lepton", self.build_lepton_column)
         # Wait with hists filling after channel masks are available
         selector.add_cut("AtLeast2Leps", partial(self.lepton_pair, is_mc),
                          no_callback=True)
-        selector.set_cat("channel", {"is_ee", "is_em", "is_mm"})
+        # We only need Lepton from here on. Unload separate
+        # electron and muon columns to save memory
+        self.unload_column("Electron")
+        self.unload_column("Muon")
         selector.set_multiple_columns(self.channel_masks)
+        selector.set_cat("channel", {"is_ee", "is_em", "is_mm"})
         selector.set_column("mll", self.mass_lepton_pair)
-        selector.set_column("dilep_pt", self.dilep_pt, lazy=True)
+        selector.set_column("dilep_pt", self.dilep_pt)
 
         selector.applying_cuts = False
 
@@ -225,8 +267,11 @@ class Processor(pepper.ProcessorBasicPhysics):
         reapply_jec = ("reapply_jec" in self.config
                        and self.config["reapply_jec"])
         selector.set_multiple_columns(partial(
-            self.compute_jet_factors, is_mc, reapply_jec, variation.junc,
+            self.compute_jet_factors, is_mc, era, reapply_jec, variation.junc,
             variation.jer, selector.rng))
+        selector.set_multiple_columns(self.evaluate_jet_ids)
+        if self.config.get("jet_veto_map"):
+            selector.add_cut("JetVeto", self.apply_jet_veto_map)
         selector.set_column("OrigJet", selector.data["Jet"])
         selector.set_column("Jet", partial(self.build_jet_column, is_mc))
         if "jet_puid_sf" in self.config and is_mc:
@@ -237,6 +282,13 @@ class Processor(pepper.ProcessorBasicPhysics):
             "MET", partial(self.build_met_column, is_mc, variation.junc,
                            variation.jer if smear_met else None, selector.rng,
                            era, variation=variation.met))
+        if variation.name is None:
+            # unload columns only after nominal selection, when they are
+            # no longer needed
+            self.unload_column("Jet")
+            self.unload_column("GenJet")
+            self.unload_column("MET")
+            self.unload_column("CorrT1METJet")
         selector.set_multiple_columns(
             partial(self.drellyan_sf_columns, selector))
         if "drellyan_sf" in self.config and is_mc:
@@ -263,11 +315,10 @@ class Processor(pepper.ProcessorBasicPhysics):
                 all_cuts=True, no_callback=True)
             selector.add_cut("Reco", self.has_ttbar_system)
             selector.set_column("reconu", self.build_nu_column_ttbar_system,
-                                all_cuts=True, lazy=True)
+                                all_cuts=True)
             selector.set_column("dark_pt", self.calculate_dark_pt,
-                                all_cuts=True, lazy=True)
-            selector.set_column("chel", self.calculate_chel, all_cuts=True,
-                                lazy=True)
+                                all_cuts=True)
+            selector.set_column("chel", self.calculate_chel, all_cuts=True)
 
     def channel_masks(self, data):
         """Get the channel masks (bool arrays) for ee, eµ and µµ decays"""
@@ -288,28 +339,30 @@ class Processor(pepper.ProcessorBasicPhysics):
         """Apply the weights due to differences of the triggers between
         data and simulation"""
         leps = data["Lepton"]
-        ones = np.ones(len(data))
-        central = ones
+        central = np.ones(len(data))
+        up = np.ones(len(data))
+        down = np.ones(len(data))
         channels = ["is_ee", "is_em", "is_mm"]
         trigger_sfs = self.config["trigger_sfs"]
         for channel in channels:
-            sf = trigger_sfs[channel](lep1_pt=leps[:, 0].pt,
-                                      lep2_pt=leps[:, 1].pt)
-            central = ak.where(data[channel], sf, central)
+            dimlabels = trigger_sfs[channel].dimlabels
+            mask = data[channel]
+            ch_leps = leps[mask]
+            if "ele_pt" in dimlabels:
+                fills = {"ele_pt": ch_leps[abs(ch_leps.pdgId) == 11][:, 0].pt,
+                         "mu_pt": ch_leps[abs(ch_leps.pdgId) == 13][:, 0].pt}
+            else:
+                fills = {"lep1_pt": ch_leps[:, 0].pt,
+                         "lep2_pt": ch_leps[:, 1].pt}
+            sf = trigger_sfs[channel](**fills)
+            central[mask] = sf
+            if self.config["compute_systematics"]:
+                up[mask] = trigger_sfs[channel](variation="up", **fills)
+                down[mask] = trigger_sfs[channel](variation="down", **fills)
         if self.config["compute_systematics"]:
-            up = ones
-            down = ones
-            for channel in channels:
-                sf = trigger_sfs[channel](lep1_pt=leps[:, 0].pt,
-                                          lep2_pt=leps[:, 1].pt,
-                                          variation="up")
-                up = ak.where(data[channel], sf, up)
-                sf = trigger_sfs[channel](lep1_pt=leps[:, 0].pt,
-                                          lep2_pt=leps[:, 1].pt,
-                                          variation="down")
-                down = ak.where(data[channel], sf, down)
             return central, {"triggersf": (up / central, down / central)}
-        return central
+        else:
+            return central
 
     def apply_dy_sfs(self, dsname, data):
         """Apply scale factors to compensate mismodeling of Drell-Yan"""
@@ -392,7 +445,7 @@ class Processor(pepper.ProcessorBasicPhysics):
         nu = data["reconu"][:, 0]
         antinu = data["reconu"][:, 1]
         met = data["MET"]
-        return met - nu - antinu
+        return met.like(nu) - nu - antinu
 
     def calculate_chel(self, data):
         """Calculate the angle between the leptons in their helicity frame"""
@@ -406,5 +459,5 @@ class Processor(pepper.ProcessorBasicPhysics):
         lep_ZMFtbar = lep[:, 0].boost(top_boost[:, 1])
         lbar_ZMFtop = lep[:, 1].boost(top_boost[:, 0])
 
-        chel = lep_ZMFtbar.dot(lbar_ZMFtop) / lep_ZMFtbar.rho / lbar_ZMFtop.rho
+        chel = lep_ZMFtbar.pvec.dot(lbar_ZMFtop.pvec) / lep_ZMFtbar.p / lbar_ZMFtop.p
         return chel

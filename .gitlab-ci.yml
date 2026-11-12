@@ -1,30 +1,213 @@
-image: gitlab-registry.cern.ch/ci-tools/ci-worker:cc7
+image: gitlab-registry.cern.ch/cms-cloud/cmssw-docker/al9-cms
 
 stages:
   - flake8
+  - setup
   - test
-before_script:
-  - yum install -y python3 python3-pip python3-devel > /dev/null
-  - pip3 install pep8-naming > /dev/null
-  - echo flake8 version `flake8 --version`
+  - build-docs
+  - pages
 
 flake8:
   stage: flake8
+  before_script:
+    - python3 -m pip install --upgrade pep8-naming > /dev/null
+    - echo flake8 version `python3 -m flake8 --version`
   script:
-    - flake8 --extend-ignore N806
+    - python3 -m flake8 --extend-ignore N806
+  rules:
+    - when: always
 
-test:
-  stage: test
+.setup_template:
+  stage: setup
   tags:
     - cvmfs
   script:
-    - source example/environment.sh
-    - python3 -m pip install --upgrade --upgrade-strategy eager --editable .
-    - cd example
-    - python3 -m pepper.runproc example_processor.py test_config.json
+    - bash install.sh
+  artifacts:
+    expire_in: 2 hours
+    paths:
+      - .venv/
+      - environment.sh
+  rules:
+    - when: always
+  variables:
+    LCG_VERSION: "109a"
+    LCG_PLATFORM: "x86_64-el9-gcc15-opt"
+
+setup:default:
+  extends: .setup_template
+
+.test_template:
+  stage: test
+  tags:
+    - cvmfs
+  needs:
+    - job: setup:default
+      artifacts: true
+  script:
+    - source environment.sh
+    - bash tests/integration/run_test.sh ${TESTNAME}
+  rules:
+    - when: always
   artifacts:
     expire_in: 10 hours
     paths:
-     - example/cutflows.json
+     - _testout/cutflows.json
+     - _testout/gen_sumws.json
+     - _testout/hists
+     - _testout/events
+  variables:
+    LCG_VERSION: "109a"
+    LCG_PLATFORM: "x86_64-el9-gcc15-opt"
+    GIT_SUBMODULE_STRATEGY: recursive
+    GIT_SUBMODULE_FORCE_HTTPS: true
+
+test:ul18_default:
+  extends: .test_template
+  variables:
+    TESTNAME: "ul18"
+
+test:ul18_kinreco:
+  extends: .test_template
+  variables:
+    TESTNAME: "ul18_kinreco"
+
+test:ul18_systs:
+  extends: .test_template
+  variables:
+    TESTNAME: "ul18_systs"
+
+test:ul18_events_root:
+  extends: .test_template
+  variables:
+    TESTNAME: "ul18_events_root"
+    TEST_EVENTS: true
+
+test:ul18_events_hdf5:
+  extends: .test_template
+  variables:
+    TESTNAME: "ul18_events_hdf5"
+    TEST_EVENTS: true
+
+test:ul18_lumifactors:
+  extends: .test_template
+  variables:
+    TESTNAME: "ul18_lumifactors"
+
+test:ul18_xrootd:
+  extends: .test_template
+  id_tokens:
+    MY_JOB_JWT:
+        aud: "cms-cat-grid-proxy-service.app.cern.ch"
+  before_script:
+    - 'proxy=$(curl -H "Authorization: ${MY_JOB_JWT}" "https://cms-cat-grid-proxy-service.app.cern.ch/api" | tr -d \")'
+  script:
+    - source environment.sh
+    - printf $proxy | base64 -d > myproxy
+    - export X509_USER_PROXY=$(pwd)/myproxy
+    - export X509_CERT_DIR=/cvmfs/grid.cern.ch/etc/grid-security/certificates/
+    - voms-proxy-info # to test it
+    - bash tests/integration/run_test.sh ${TESTNAME}
+  variables:
+    TESTNAME: "ul18_xrootd"
+    TEST_EXTRA_ARGS: "--debug"
+  rules:
+    - when: always
+      allow_failure: true # since it doesnt work on forks that are not under cms-analysis
+
+test:2024:
+  extends: .test_template
+  variables:
+    TESTNAME: "2024"
+
+test:2024_chunksize_0:
+  extends: .test_template
+  variables:
+    TESTNAME: "2024"
+    TEST_EXTRA_ARGS: "--chunksize 0"
+
+test:ul18_toml:
+  extends: .test_template
+  needs:
+    - job: setup:default
+      artifacts: true
+  before_script:
+    - source environment.sh
+    - python3 -m pip install --upgrade hjson tomli-w
+    - python3 scripts/json_to_toml.py tests/integration/configs/test_config_ul18.json tests/integration/configs/test_config_ul18.toml
+  script:
+    - source environment.sh
+    - bash tests/integration/run_test.sh ${TESTNAME} toml
+  variables:
+    TESTNAME: "ul18"
+
+.unit_template:
+  extends: .test_template
+  before_script:
+    - source environment.sh
+    - python3 -m pip install tomli tomli-w > /dev/null  # pytest from LCG; pytest 9 breaks its plugins
+  artifacts:
+    when: always
+    expire_in: 1 week
+    reports:
+      junit: report.xml
+
+test:unit:
+  extends: .unit_template
+  script:
+    - source environment.sh
+    - python3 -m pytest tests/unit -p no:ctest_measurements_reporter -m "not needs_grid" --junitxml=report.xml
+
+test:unit_grid:
+  extends: .unit_template
+  id_tokens:
+    MY_JOB_JWT:
+        aud: "cms-cat-grid-proxy-service.app.cern.ch"
+  script:
+    - 'proxy=$(curl -H "Authorization: ${MY_JOB_JWT}" "https://cms-cat-grid-proxy-service.app.cern.ch/api" | tr -d \")'
+    - source environment.sh
+    - printf $proxy | base64 -d > myproxy
+    - export X509_USER_PROXY=$(pwd)/myproxy
+    - export X509_CERT_DIR=/cvmfs/grid.cern.ch/etc/grid-security/certificates/
+    - python3 -m pytest tests/unit -p no:ctest_measurements_reporter -m needs_grid --junitxml=report.xml
+  rules:
+    - when: always
+      allow_failure: true # since it doesnt work on forks that are not under cms-analysis
+
+build-docs:
+  stage: build-docs
+  tags:
+    - cvmfs
+  needs:
+    - job: setup:default
+      artifacts: true
+  script:
+    - source environment.sh
+    - python3 -m pip install --upgrade --editable .[docs]
+    - cd docs
+    - make html
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'  # Always run on master branch
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - docs/**/*
+        - "*.md"
+        - pepper/**/*.py
+  artifacts:
+    paths:
+      - docs/_build/html
 
 
+pages:
+  stage: pages
+  tags:
+    - cvmfs
+  dependencies:
+    - build-docs
+  script:
+    - mv docs/_build/html public
+  artifacts:
+    paths:
+      - public
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
