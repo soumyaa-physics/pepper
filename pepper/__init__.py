@@ -9,6 +9,7 @@ from pepper.selector import Selector
 from pepper.kinreco_sonnenschein import sonnenschein
 from pepper.config import Config
 from pepper.config_basic import ConfigBasicPhysics
+from pepper.config_stau import ConfigSTau as ConfigSTau
 from pepper.config_ttbarll import ConfigTTbarLL
 from pepper.processor import Processor
 from pepper.processor_basic import ProcessorBasicPhysics
@@ -28,6 +29,7 @@ __all__ = [
     "sonnenschein",
     "Config",
     "ConfigBasicPhysics",
+    "ConfigSTau",
     "ConfigTTbarLL",
     "Processor",
     "ProcessorBasicPhysics",

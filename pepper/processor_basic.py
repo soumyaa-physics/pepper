@@ -552,6 +552,7 @@ class ProcessorBasicPhysics(pepper.Processor):
             data["Flag"]["goodVertices"]
             & data["Flag"]["globalSuperTightHalo2016Filter"]
             & data["Flag"]["EcalDeadCellTriggerPrimitiveFilter"]
+            & data["Flag"]["eeBadScFilter"]
             & data["Flag"]["BadPFMuonFilter"])
 
         if not (year in ("2016", "2017", "2018") and is_mc):
