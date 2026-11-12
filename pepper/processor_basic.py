@@ -461,7 +461,7 @@ class ProcessorBasicPhysics(pepper.Processor):
             f"{np.count_nonzero(triggered)} / {len(data)} events pass"
         )
 
-        for trigger_path in neg_triggers:
+        for trigger_path in neg_triggers: # maybe to avoid duplicating events?
             if trigger_path not in available:
                 continue
 
